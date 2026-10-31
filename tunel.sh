@@ -42,6 +42,7 @@ esac
 # 版本固化：只从本仓库 vendor 下载，sha256 必须与 vendor/SHA256SUMS 一致
 # ============================================================================
 TUNEL_VERSION="2.0.0"
+DEFAULT_CHECK_INTERVAL=7200
 VENDOR_CF_TAG="2026.10.7"
 VENDOR_SB_TAG="1.14.4"
 VENDOR_REPO="${VENDOR_REPO:-bitscr/tunel}"
@@ -60,72 +61,128 @@ efb46daaa48ee55e090bd1dfcaee34bfbe9bdbd9b89fa9f328d25f81a619e865  vendor/sing-bo
 fd164ed45ebc784f657a3e1d0e0ad0f68afdcff864ee57122c2cfed3ddb80a00  vendor/sing-box/sing-box-1.14.4-linux-armv7.tar.gz
 "
 
-# 默认 root 安装保留旧路径；普通用户或显式 TUNEL_HOME 使用独立便携树。
-TUNEL_SYSTEM=1
-TUNEL_PATH_ERROR=""
-if [ "$EUID" != 0 ] || [ -n "${TUNEL_HOME:-}" ]; then
-    TUNEL_SYSTEM=0
-    if [ -z "${TUNEL_HOME:-}" ] && [ -z "${HOME:-}" ]; then
-        TUNEL_PATH_ERROR="用户模式未设置 HOME，请显式设置专用的绝对路径 TUNEL_HOME。"
-    fi
-    TUNEL_HOME=${TUNEL_HOME:-${HOME:-}/.local/share/tunel}
-    TUNEL_HOME=${TUNEL_HOME%/}
-    # 包装脚本与 ingress 都需引用目录，明确拒绝不能安全贯穿所有后端的格式。
-    if [[ ! "$TUNEL_HOME" =~ ^/[A-Za-z0-9._/-]+$ ]] || [[ "/$TUNEL_HOME/" == *'/../'* || "/$TUNEL_HOME/" == *'/./'* ]]; then
-        TUNEL_PATH_ERROR="TUNEL_HOME 必须是无空格、引号和 shell 特殊字符的绝对路径，且不能包含 . 或 .. 段: $TUNEL_HOME"
-    else
-        # 解析已存在的父目录，防止符号链接把便携树指向用户 home 或系统根。
-        __tunel_anchor=$TUNEL_HOME; __tunel_suffix=""
-        while [ ! -d "$__tunel_anchor" ] && [ "$__tunel_anchor" != / ]; do
-            if [ -e "$__tunel_anchor" ] || [ -L "$__tunel_anchor" ]; then
-                TUNEL_PATH_ERROR="TUNEL_HOME 的路径不是目录: $__tunel_anchor"; break
-            fi
-            __tunel_suffix="/${__tunel_anchor##*/}$__tunel_suffix"
-            __tunel_anchor=${__tunel_anchor%/*}; __tunel_anchor=${__tunel_anchor:-/}
-        done
-        if [ -z "$TUNEL_PATH_ERROR" ]; then
-            __tunel_physical=$(cd "$__tunel_anchor" 2>/dev/null && pwd -P)
-            if [ -z "$__tunel_physical" ]; then
-                TUNEL_PATH_ERROR="无法访问 TUNEL_HOME 的父目录: $__tunel_anchor"
-            else
-                TUNEL_HOME="${__tunel_physical%/}$__tunel_suffix"
-                __tunel_user_home=$(cd "${HOME:-/nonexistent}" 2>/dev/null && pwd -P)
-                case "$TUNEL_HOME" in
-                    /|/etc|/usr|/usr/local|/var|/var/log|/run|/home|/root|/bin|/sbin|/lib|/lib64|/boot|/dev|/proc|/sys|/tmp|/opt|/mnt|/media)
-                        TUNEL_PATH_ERROR="TUNEL_HOME 不能使用受保护的系统目录: $TUNEL_HOME" ;;
-                esac
-                if [ -n "$__tunel_user_home" ] && [ "$TUNEL_HOME" = "$__tunel_user_home" ]; then
-                    TUNEL_PATH_ERROR="TUNEL_HOME 不能是用户 home 本身，请使用其下专用目录: $TUNEL_HOME"
+# 默认 root 安装保留旧路径；安装前的权限兜底可重算同一组派生路径。
+setup_paths() {
+    local __tunel_anchor __tunel_suffix __tunel_physical __tunel_user_home
+    TUNEL_SYSTEM=1
+    TUNEL_PATH_ERROR=""
+    if [ "$EUID" != 0 ] || [ -n "${TUNEL_HOME:-}" ]; then
+        TUNEL_SYSTEM=0
+        if [ -z "${TUNEL_HOME:-}" ] && [ -z "${HOME:-}" ]; then
+            TUNEL_PATH_ERROR="用户模式未设置 HOME，请显式设置专用的绝对路径 TUNEL_HOME。"
+        fi
+        TUNEL_HOME=${TUNEL_HOME:-${HOME:-}/.local/share/tunel}
+        TUNEL_HOME=${TUNEL_HOME%/}
+        # 包装脚本与 ingress 都需引用目录，明确拒绝不能安全贯穿所有后端的格式。
+        if [[ ! "$TUNEL_HOME" =~ ^/[A-Za-z0-9._/-]+$ ]] || [[ "/$TUNEL_HOME/" == *'/../'* || "/$TUNEL_HOME/" == *'/./'* ]]; then
+            TUNEL_PATH_ERROR="TUNEL_HOME 必须是无空格、引号和 shell 特殊字符的绝对路径，且不能包含 . 或 .. 段: $TUNEL_HOME"
+        else
+            # 解析已存在的父目录，防止符号链接把便携树指向用户 home 或系统根。
+            __tunel_anchor=$TUNEL_HOME; __tunel_suffix=""
+            while [ ! -d "$__tunel_anchor" ] && [ "$__tunel_anchor" != / ]; do
+                if [ -e "$__tunel_anchor" ] || [ -L "$__tunel_anchor" ]; then
+                    TUNEL_PATH_ERROR="TUNEL_HOME 的路径不是目录: $__tunel_anchor"; break
                 fi
-                [[ "$TUNEL_HOME" =~ ^/[A-Za-z0-9._/-]+$ ]] || TUNEL_PATH_ERROR="TUNEL_HOME 解析后的目录包含不支持的字符: $TUNEL_HOME"
+                __tunel_suffix="/${__tunel_anchor##*/}$__tunel_suffix"
+                __tunel_anchor=${__tunel_anchor%/*}; __tunel_anchor=${__tunel_anchor:-/}
+            done
+            if [ -z "$TUNEL_PATH_ERROR" ]; then
+                __tunel_physical=$(cd "$__tunel_anchor" 2>/dev/null && pwd -P)
+                if [ -z "$__tunel_physical" ]; then
+                    TUNEL_PATH_ERROR="无法访问 TUNEL_HOME 的父目录: $__tunel_anchor"
+                else
+                    TUNEL_HOME="${__tunel_physical%/}$__tunel_suffix"
+                    __tunel_user_home=$(cd "${HOME:-/nonexistent}" 2>/dev/null && pwd -P)
+                    case "$TUNEL_HOME" in
+                        /|/etc|/usr|/usr/local|/var|/var/log|/run|/home|/root|/bin|/sbin|/lib|/lib64|/boot|/dev|/proc|/sys|/tmp|/opt|/mnt|/media)
+                            TUNEL_PATH_ERROR="TUNEL_HOME 不能使用受保护的系统目录: $TUNEL_HOME" ;;
+                    esac
+                    if [ -n "$__tunel_user_home" ] && [ "$TUNEL_HOME" = "$__tunel_user_home" ]; then
+                        TUNEL_PATH_ERROR="TUNEL_HOME 不能是用户 home 本身，请使用其下专用目录: $TUNEL_HOME"
+                    fi
+                    [[ "$TUNEL_HOME" =~ ^/[A-Za-z0-9._/-]+$ ]] || TUNEL_PATH_ERROR="TUNEL_HOME 解析后的目录包含不支持的字符: $TUNEL_HOME"
+                fi
             fi
         fi
+        # 导出规范化目录，让 self、ctl、守护及重启始终定位同一套安装。
+        export TUNEL_HOME
+        WORK_DIR="$TUNEL_HOME/work"; BIN_DIR="$TUNEL_HOME/bin"
+        LOG_DIR="$TUNEL_HOME/log"; RUN_DIR="$TUNEL_HOME/run"
+    else
+        WORK_DIR="/etc/cf-tunel"; BIN_DIR="/usr/local/bin"
+        LOG_DIR="/var/log/cf-tunel"; RUN_DIR="/run"
     fi
-    # 导出规范化目录，让 self、ctl、守护及重启始终定位同一套安装。
-    export TUNEL_HOME
-    WORK_DIR="$TUNEL_HOME/work"; BIN_DIR="$TUNEL_HOME/bin"
-    LOG_DIR="$TUNEL_HOME/log"; RUN_DIR="$TUNEL_HOME/run"
-else
-    WORK_DIR="/etc/cf-tunel"; BIN_DIR="/usr/local/bin"
-    LOG_DIR="/var/log/cf-tunel"; RUN_DIR="/run"
-fi
-unset __tunel_anchor __tunel_suffix __tunel_physical __tunel_user_home
-SB_DIR="$WORK_DIR/sing-box"
-SB_BIN="$SB_DIR/sing-box"
-SB_CFG="$SB_DIR/config.json"
-CF_BIN="$WORK_DIR/cloudflared"
-ARGO_LOG="$WORK_DIR/argo.log"
-TUNNEL_YML="$WORK_DIR/tunnel.yml"
-TUNNEL_JSON="$WORK_DIR/tunnel.json"
-NODE_DIR="$WORK_DIR/nodes"
-TMP_DIR="$WORK_DIR/tmp"
-ARGO_TOKEN_FILE="$WORK_DIR/argo.token"
-AGENT_ENV="$WORK_DIR/agent.env"
-AGENT_STATE="$WORK_DIR/agent.state"
-AGENT_LOG="$WORK_DIR/agent.log"
-AGENT_LOCK="$RUN_DIR/cf-tunel-agent.lock"
-SELF_INSTALL="$BIN_DIR/tunel"
-SELF_SCRIPT="$WORK_DIR/tunel.sh"
+    SB_DIR="$WORK_DIR/sing-box"
+    SB_BIN="$SB_DIR/sing-box"
+    SB_CFG="$SB_DIR/config.json"
+    CF_BIN="$WORK_DIR/cloudflared"
+    ARGO_LOG="$WORK_DIR/argo.log"
+    TUNNEL_YML="$WORK_DIR/tunnel.yml"
+    TUNNEL_JSON="$WORK_DIR/tunnel.json"
+    NODE_DIR="$WORK_DIR/nodes"
+    TMP_DIR="$WORK_DIR/tmp"
+    ARGO_TOKEN_FILE="$WORK_DIR/argo.token"
+    AGENT_ENV="$WORK_DIR/agent.env"
+    AGENT_STATE="$WORK_DIR/agent.state"
+    AGENT_LOG="$WORK_DIR/agent.log"
+    AGENT_LOCK="$RUN_DIR/cf-tunel-agent.lock"
+    SELF_INSTALL="$BIN_DIR/tunel"
+    SELF_SCRIPT="$WORK_DIR/tunel.sh"
+}
+
+# 只读检查目录或最近已有父目录，不用创建临时文件探测系统权限。
+path_write_preflight() {
+    local probe=$1
+    TUNEL_PREFLIGHT_REASON=""
+    while [ ! -d "$probe" ] && [ "$probe" != / ]; do
+        if [ -e "$probe" ] || [ -L "$probe" ]; then
+            TUNEL_PREFLIGHT_REASON="$probe 不是可用目录"; return 1
+        fi
+        probe=${probe%/*}; probe=${probe:-/}
+    done
+    if [ ! -d "$probe" ] || [ ! -w "$probe" ] || [ ! -x "$probe" ]; then
+        TUNEL_PREFLIGHT_REASON="$probe 不可写或无法访问"; return 1
+    fi
+    return 0
+}
+
+# 仅默认系统安装自动选用户目录，其他命令与显式 TUNEL_HOME 保持原安装归属。
+install_paths_preflight() {
+    local path reason="" rc=0
+    case "$COMMAND" in
+        quick|fixed) : ;;
+        menu) [ "${1:-}" = menu-install ] || return 0 ;;
+        *) return 0 ;;
+    esac
+    [ "$TUNEL_SYSTEM" = 1 ] && [ "$EUID" = 0 ] || return 0
+    for path in "$WORK_DIR" "$BIN_DIR" "$LOG_DIR" "$RUN_DIR"; do
+        if ! path_write_preflight "$path"; then reason=$TUNEL_PREFLIGHT_REASON; break; fi
+    done
+    [ -n "$reason" ] || return 0
+    if [ -z "${HOME:-}" ] || [[ "$HOME" != /* ]] || [ ! -d "$HOME" ] || [ ! -x "$HOME" ]; then
+        echo "错误: 系统安装目录不可用（$reason），且 HOME 未设置为可访问的绝对目录；请显式设置可写的 TUNEL_HOME。" >&2
+        return 1
+    fi
+    TUNEL_HOME="${HOME%/}/.local/share/tunel"
+    setup_paths
+    if [ -n "$TUNEL_PATH_ERROR" ]; then
+        echo "错误: 无法自动选择用户目录: $TUNEL_PATH_ERROR" >&2; rc=2
+    elif ! portable_paths_valid; then
+        rc=2
+    else
+        for path in "$TUNEL_HOME" "$WORK_DIR" "$BIN_DIR" "$LOG_DIR" "$RUN_DIR" "$SB_DIR" "$NODE_DIR" "$TMP_DIR"; do
+            if ! path_write_preflight "$path"; then
+                echo "错误: 系统安装目录不可用（$reason），HOME 下的便携目录也不可用: $TUNEL_PREFLIGHT_REASON；请显式设置可写的 TUNEL_HOME。" >&2
+                rc=1; break
+            fi
+        done
+    fi
+    # 候选目录失败时保留菜单原归属，后续查看或卸载仍指向旧系统安装。
+    if [ "$rc" != 0 ]; then unset TUNEL_HOME; setup_paths; return "$rc"; fi
+    echo "提示: 系统安装目录不可用（$reason），已自动选择便携安装目录 TUNEL_HOME=$TUNEL_HOME（工作目录 $WORK_DIR）。" >&2
+}
+
+setup_paths
 SVC_SB="cf-tunel-singbox"
 SVC_ARGO="cf-tunel-argo"
 SVC_AGENT="cf-tunel-agent"
@@ -504,12 +561,30 @@ sb_arch() { # sing-box 资产名后缀
 # ============================================================================
 # 内核安装（都是从 vendor 走 sha256）
 # ============================================================================
-# 固化 cloudflared 版本并强校验下载，已有可执行核心无需重复下载。
+# 版本命令必须成功且返回内容，不能把空版本或不可运行的文件当作已安装。
+core_version_read() {
+    local bin=$1 argument=$2 output rc
+    CORE_VERSION_TEXT=""; CORE_VERSION_ERROR=""
+    if output=$("$bin" "$argument" 2>&1); then rc=0; else rc=$?; fi
+    if [ "$rc" != 0 ] || [ -z "$output" ]; then
+        CORE_VERSION_ERROR="版本命令退出码 $rc；架构 $(uname -m)"
+        [ -z "$output" ] || CORE_VERSION_ERROR+=$'\n'"$output"
+        [ -n "$output" ] || CORE_VERSION_ERROR+=$'\n'"未返回版本信息。"
+        return 1
+    fi
+    CORE_VERSION_TEXT=$(printf '%s\n' "$output" | head -1)
+}
+
+# 复用可运行的核心；损坏或不兼容时先下载验证，再替换已有文件。
 install_cloudflared() {
     install_soft curl || return 3
     if [ -x "$CF_BIN" ]; then
-        echo -e "${green}已存在 cloudflared $( "$CF_BIN" --version 2>/dev/null | head -1)${re}"
-        return 0
+        if core_version_read "$CF_BIN" --version; then
+            echo -e "${green}已存在 cloudflared $CORE_VERSION_TEXT${re}"
+            return 0
+        fi
+        echo "警告: 已有 cloudflared 无法正常运行，将从 vendor 重新安装: $CF_BIN" >&2
+        printf '%s\n' "$CORE_VERSION_ERROR" >&2
     fi
     local arch tmp
     arch=$(cf_arch) || { echo -e "${red}错误: 当前架构 $(uname -m) 没有 cloudflared 构建${re}"; return 1; }
@@ -518,14 +593,19 @@ install_cloudflared() {
     if ! vendor_fetch "cloudflared/cloudflared-linux-$arch" "$tmp/cloudflared"; then
         rm -rf "$tmp"; return 1
     fi
-    mkdir -p -m 700 "$WORK_DIR"
-    install_bin "$tmp/cloudflared" "$CF_BIN" || { rm -rf "$tmp"; return 1; }
-    rm -rf "$tmp"
-    if ! "$CF_BIN" --version >/dev/null 2>&1; then
-        echo -e "${red}错误: cloudflared 二进制无法在本机运行${re}"
-        return 1
+    if ! chmod 755 "$tmp/cloudflared" || ! core_version_read "$tmp/cloudflared" --version; then
+        echo "错误: 下载的 cloudflared 无法在本机运行，原文件未替换。" >&2
+        printf '%s\n' "$CORE_VERSION_ERROR" >&2
+        rm -rf "$tmp"; return 3
     fi
-    echo -e "${green}已安装 cloudflared $( "$CF_BIN" --version 2>/dev/null | head -1)${re}"
+    if svc_running "$SVC_ARGO" "$SVC_ARGO"; then
+        svc_stop "$SVC_ARGO" "$SVC_ARGO" || { echo "错误: 替换 cloudflared 前无法停止 $SVC_ARGO 服务。" >&2; rm -rf "$tmp"; return 1; }
+    fi
+    mkdir -p -m 700 "$WORK_DIR" && install_bin "$tmp/cloudflared" "$CF_BIN" || {
+        echo "错误: 无法将 cloudflared 安装到 $CF_BIN" >&2; rm -rf "$tmp"; return 1
+    }
+    rm -rf "$tmp"
+    echo -e "${green}已安装 cloudflared $CORE_VERSION_TEXT${re}"
     return 0
 }
 
@@ -533,8 +613,12 @@ install_cloudflared() {
 install_singbox_core() {
     install_soft curl || return 3
     if [ -x "$SB_BIN" ]; then
-        echo -e "${green}已存在 sing-box $( "$SB_BIN" version 2>/dev/null | head -1)${re}"
-        return 0
+        if core_version_read "$SB_BIN" version; then
+            echo -e "${green}已存在 sing-box $CORE_VERSION_TEXT${re}"
+            return 0
+        fi
+        echo "警告: 已有 sing-box 无法正常运行，将从 vendor 重新安装: $SB_BIN" >&2
+        printf '%s\n' "$CORE_VERSION_ERROR" >&2
     fi
     local arch asset tmp
     arch=$(sb_arch) || { echo -e "${red}错误: 当前架构 $(uname -m) 没有 sing-box 构建${re}"; return 1; }
@@ -554,14 +638,19 @@ install_singbox_core() {
         echo -e "${red}错误: 压缩包里没找到 sing-box 可执行文件${re}"
         rm -rf "$tmp"; return 1
     fi
-    mkdir -p -m 700 "$SB_DIR"
-    install_bin "$bin" "$SB_BIN" || { rm -rf "$tmp"; return 1; }
-    rm -rf "$tmp"
-    if ! "$SB_BIN" version >/dev/null 2>&1; then
-        echo -e "${red}错误: sing-box 二进制无法在本机运行${re}"
-        return 1
+    if ! chmod 755 "$bin" || ! core_version_read "$bin" version; then
+        echo "错误: 下载的 sing-box 无法在本机运行，原文件未替换。" >&2
+        printf '%s\n' "$CORE_VERSION_ERROR" >&2
+        rm -rf "$tmp"; return 3
     fi
-    echo -e "${green}已安装 sing-box $( "$SB_BIN" version 2>/dev/null | head -1)${re}"
+    if svc_running "$SVC_SB" "$SVC_SB"; then
+        svc_stop "$SVC_SB" "$SVC_SB" || { echo "错误: 替换 sing-box 前无法停止 $SVC_SB 服务。" >&2; rm -rf "$tmp"; return 1; }
+    fi
+    mkdir -p -m 700 "$SB_DIR" && install_bin "$bin" "$SB_BIN" || {
+        echo "错误: 无法将 sing-box 安装到 $SB_BIN" >&2; rm -rf "$tmp"; return 1
+    }
+    rm -rf "$tmp"
+    echo -e "${green}已安装 sing-box $CORE_VERSION_TEXT${re}"
     return 0
 }
 
@@ -569,9 +658,8 @@ install_singbox_core() {
 # sing-box 配置：vmess + ws 明文（TLS 由 CF 边缘负责）
 # ============================================================================
 sb_write_config() { # $1=监听端口 $2=uuid $3=ws路径
-    local port=$1 uuid=$2 path=$3
-    mkdir -p -m 700 "$SB_DIR"
-    chmod 700 "$SB_DIR"
+    local port=$1 uuid=$2 path=$3 details rc
+    mkdir -p -m 700 "$SB_DIR" && chmod 700 "$SB_DIR" || { echo "错误: 无法准备 sing-box 配置目录 $SB_DIR" >&2; return 1; }
     cat > "$SB_CFG" <<EOF
 {
   "log": { "level": "warn", "timestamp": true },
@@ -594,8 +682,12 @@ sb_write_config() { # $1=监听端口 $2=uuid $3=ws路径
   ]
 }
 EOF
-    chmod 600 "$SB_CFG"
-    "$SB_BIN" check -c "$SB_CFG" >/dev/null 2>&1
+    rc=$?
+    [ "$rc" = 0 ] && chmod 600 "$SB_CFG" || { echo "错误: 无法写入 sing-box 配置 $SB_CFG" >&2; return 1; }
+    if details=$("$SB_BIN" check -c "$SB_CFG" 2>&1); then return 0; else rc=$?; fi
+    echo "错误: sing-box 配置检查失败（退出码 $rc）: $SB_CFG" >&2
+    [ -z "$details" ] || printf '%s\n' "$details" >&2
+    return "$rc"
 }
 
 # 统一交互入口：管道与服务进程永远取默认值，避免安装等待 stdin。
@@ -660,7 +752,7 @@ setting_valid() {
         NODE_NAME) [[ "$val" =~ ^[A-Za-z0-9._-]{1,64}$ ]] ;;
         CFIP) [[ -z "$val" || "$val" =~ ^[A-Za-z0-9.:-]+$ ]] ;;
         CHECK_INTERVAL) [[ "$val" =~ ^[0-9]{1,5}$ ]] && ((10#$val >= 300 && 10#$val <= 86400)) ;;
-        WATCH_INTERVAL) [[ "$val" =~ ^[0-9]{1,4}$ ]] && ((10#$val == 0 || (10#$val >= 15 && 10#$val <= 3600))) ;;
+        WATCH_INTERVAL) [[ "$val" =~ ^[0-9]{1,5}$ ]] && ((10#$val == 0 || (10#$val >= 15 && 10#$val <= 86400))) ;;
         *) return 1 ;; # 白名单拒绝覆盖 MODE/UUID/PATH 等运行身份字段。
     esac
 }
@@ -673,11 +765,8 @@ agent_load() {
     NODE_ID=$(env_get "$AGENT_ENV" NODE_ID); NODE_NAME=$(env_get "$AGENT_ENV" NODE_NAME)
     CFIP=$(env_get "$AGENT_ENV" CFIP); REPORT_URL=$(env_get "$AGENT_ENV" REPORT_URL)
     REPORT_TOKEN=$(env_get "$AGENT_ENV" REPORT_TOKEN)
-    CHECK_INTERVAL=$(env_get "$AGENT_ENV" CHECK_INTERVAL); CHECK_INTERVAL=${CHECK_INTERVAL:-7200}
-    WATCH_INTERVAL=$(env_get "$AGENT_ENV" WATCH_INTERVAL); WATCH_INTERVAL=${WATCH_INTERVAL:-60}
-    PROBE_RETRIES=$(env_get "$AGENT_ENV" PROBE_RETRIES); PROBE_RETRIES=${PROBE_RETRIES:-3}
-    RESTART_BUDGET=$(env_get "$AGENT_ENV" RESTART_BUDGET); RESTART_BUDGET=${RESTART_BUDGET:-5}
-    RESTART_WINDOW=$(env_get "$AGENT_ENV" RESTART_WINDOW); RESTART_WINDOW=${RESTART_WINDOW:-3600}
+    CHECK_INTERVAL=$(env_get "$AGENT_ENV" CHECK_INTERVAL); CHECK_INTERVAL=${CHECK_INTERVAL:-$DEFAULT_CHECK_INTERVAL}
+    WATCH_INTERVAL=$(env_get "$AGENT_ENV" WATCH_INTERVAL); WATCH_INTERVAL=${WATCH_INTERVAL:-$DEFAULT_CHECK_INTERVAL}
     LAST_REPORTED_DOMAIN=$(env_get "$AGENT_ENV" LAST_REPORTED_DOMAIN)
 }
 
@@ -695,13 +784,12 @@ agent_env_ensure() {
     for k in MODE PORT UUID PATH DOMAIN METRICS_PORT CFIP REPORT_URL REPORT_TOKEN LAST_REPORTED_DOMAIN; do
         grep -q "^$k=" "$AGENT_ENV" || env_set "$AGENT_ENV" "$k" ""
     done
-    for k in NODE_ID NODE_NAME CHECK_INTERVAL WATCH_INTERVAL PROBE_RETRIES RESTART_BUDGET RESTART_WINDOW LAST_REPORT_TS LAST_DOMAIN_TS; do
+    for k in NODE_ID NODE_NAME CHECK_INTERVAL WATCH_INTERVAL LAST_REPORT_TS LAST_DOMAIN_TS; do
         if [ -z "$(env_get "$AGENT_ENV" "$k")" ]; then
             # 默认值集中在这里，迁移与全新安装得到相同配置。
             case "$k" in
                 NODE_ID) value=$(default_node_id) ;; NODE_NAME) value=$(node_name_clean "$(hostname -s)") ;;
-                CHECK_INTERVAL) value=7200 ;; WATCH_INTERVAL) value=60 ;; PROBE_RETRIES) value=3 ;;
-                RESTART_BUDGET) value=5 ;; RESTART_WINDOW) value=3600 ;; *) value=0 ;;
+                CHECK_INTERVAL|WATCH_INTERVAL) value=$DEFAULT_CHECK_INTERVAL ;; *) value=0 ;;
             esac
             env_set "$AGENT_ENV" "$k" "$value" || return 1
         fi
@@ -827,7 +915,7 @@ tunel 2.0.0 — vmess-ws 隧道与自动上报
 安装选项（支持 --k=v）:
   --port N --name X --cfip H --node-id ID
   --report-url U --report-token T --check-interval S (300–86400，默认7200)
-  --watch-interval S (0 或15–3600，默认60) --no-agent -y/--yes
+  --watch-interval S (0 或15–86400，默认7200) --no-agent -y/--yes
 可用环境变量: TUNEL_NODE_NAME TUNEL_CFIP TUNEL_NODE_ID
               TUNEL_REPORT_URL TUNEL_REPORT_TOKEN
               TUNEL_HOME（普通用户默认 $HOME/.local/share/tunel）
@@ -917,11 +1005,19 @@ depend() {
     after net
 }
 EOF
-            chmod 755 "/etc/init.d/$oname" && rc-update add "$oname" default >/dev/null 2>&1 && rc-service "$oname" restart 9>&- >/dev/null 2>&1 ;;
+            chmod 755 "/etc/init.d/$oname" && rc-update add "$oname" default >/dev/null 2>&1 && rc-service "$oname" restart 9>&- ;;
         none)
             # 容器没有 init 时使用同一包装脚本，控制脚本保存 PID。
             svc_none_install "$oname" "$logdir" ;;
     esac
+    local rc=$?
+    if [ "$rc" != 0 ]; then
+        echo "错误: 注册或启动服务 $oname 失败（init: $ENV_INIT，退出码 $rc）。" >&2
+        echo "服务日志: $logdir/access.log / $logdir/error.log" >&2
+        [ ! -s "$logdir/error.log" ] || tail -n 20 "$logdir/error.log" >&2
+        [ "$oname" != "$SVC_ARGO" ] || echo "cloudflared 日志: $ARGO_LOG" >&2
+    fi
+    return "$rc"
 }
 
 # 无 init 控制脚本记录 PID 和 starttime，旧纯数字 PID 只在命令路径匹配时接管。
@@ -1343,7 +1439,7 @@ dependencies_ensure() {
     done
 }
 
-# 保存本次安装身份，显式选项覆盖旧上报配置，未提供则保留已配置值。
+# 保存本次安装身份；上报配置可沿用旧值，未指定的检查周期统一为两小时。
 install_env_write() {
     local key val
     env_set "$AGENT_ENV" MODE "$MODE"
@@ -1355,7 +1451,8 @@ install_env_write() {
         case "$key" in
             NAME) val=${OPT_NAME:-}; key=NODE_NAME ;; CFIP) val=${OPT_CFIP:-} ;;
             NODE_ID) val=${OPT_NODE_ID:-} ;; REPORT_URL) val=${OPT_REPORT_URL:-} ;; REPORT_TOKEN) val=${OPT_REPORT_TOKEN:-} ;;
-            CHECK) val=${OPT_CHECK:-}; key=CHECK_INTERVAL ;; WATCH) val=${OPT_WATCH:-}; key=WATCH_INTERVAL ;;
+            CHECK) val=${OPT_CHECK:-$DEFAULT_CHECK_INTERVAL}; key=CHECK_INTERVAL ;;
+            WATCH) val=${OPT_WATCH:-$DEFAULT_CHECK_INTERVAL}; key=WATCH_INTERVAL ;;
         esac
         [ -z "$val" ] || env_set "$AGENT_ENV" "$key" "$val" || return 1
     done
@@ -1372,6 +1469,7 @@ install_tunnel() {
     dependencies_ensure || return 3
     agent_env_ensure || return 1
     install_cloudflared && install_singbox_core || return 3
+    echo "正在停止旧服务并准备隧道配置…"
     # 先停 agent 再替换隧道，防止监视线程上传中间配置。
     svc_remove "$SVC_AGENT" "$SVC_AGENT"
     # 清理旧无 init 自启，--no-agent 才不会在下次开机又被旧钩子装回。
@@ -1393,9 +1491,14 @@ install_tunnel() {
     else
         rm -f "$ARGO_TOKEN_FILE" "$TUNNEL_JSON" "$TUNNEL_YML"
     fi
-    sb_write_config "$PORT" "$UUID" "$WS_PATH" && sb_service_up || return 1
+    echo "正在生成 sing-box 配置: $SB_CFG"
+    sb_write_config "$PORT" "$UUID" "$WS_PATH" || return 1
+    echo "正在启动 sing-box 服务…"
+    sb_service_up || return 1
     : > "$ARGO_LOG"
+    echo "正在启动 cloudflared 服务…"
     argo_service_configure || return 1
+    echo "正在获取隧道域名…"
     wait_new_domain "" 90 >/dev/null || { agent_log ERR "隧道域名获取失败，请检查 /quicktunnel 与 $ARGO_LOG"; return 5; }
     domain=$WAIT_DOMAIN
     DOMAIN=$domain; env_set "$AGENT_ENV" DOMAIN "$DOMAIN"; nodes_refresh
@@ -1432,9 +1535,13 @@ argo_restart_controlled() {
     [ "$MODE" != fixed ] || old=""
     wait_new_domain "$old" 60 >/dev/null || { agent_log ERR "重启后获取新域名超时"; return 5; }
     d=$WAIT_DOMAIN
-    DOMAIN=$d; env_set "$AGENT_ENV" DOMAIN "$DOMAIN"
-    env_set "$AGENT_ENV" LAST_DOMAIN_TS "$(date +%s)"
-    nodes_refresh
+    DOMAIN=$d
+    env_set "$AGENT_ENV" DOMAIN "$DOMAIN" && env_set "$AGENT_ENV" LAST_DOMAIN_TS "$(date +%s)" || {
+        agent_log ERR "新域名保存失败: $AGENT_ENV"; return 1
+    }
+    nodes_refresh || { agent_log ERR "新域名节点文件更新失败: $NODE_DIR"; return 1; }
+    agent_log INFO "隧道已重建，当前域名: $DOMAIN"
+    return 0
 }
 
 # 手动重启是一条受控操作，允许强制上报固定域名。
@@ -1446,82 +1553,33 @@ tunnel_refresh_domain() {
     show_node
 }
 
-# 运行期计数独立于配置，删除 state 后下一次远端体检立即执行。
+# 检查时间独立于配置，删除 state 后下一轮立即检查连接。
 agent_state_load() {
-    RESTART_TS=$(env_get "$AGENT_STATE" RESTART_TS)
     LAST_CHECK_TS=$(env_get "$AGENT_STATE" LAST_CHECK_TS); LAST_CHECK_TS=${LAST_CHECK_TS:-0}
     LAST_WATCH_TS=$(env_get "$AGENT_STATE" LAST_WATCH_TS); LAST_WATCH_TS=${LAST_WATCH_TS:-0}
 }
 
-# 保存本轮计数，特殊的十分钟重试时间由体检分支决定，不在此覆盖。
+# 成功与失败都保存本轮时间，下一轮仍按配置周期执行。
 agent_state_save() {
-    env_set "$AGENT_STATE" RESTART_TS "$RESTART_TS"
     env_set "$AGENT_STATE" LAST_CHECK_TS "$LAST_CHECK_TS"
     env_set "$AGENT_STATE" LAST_WATCH_TS "$LAST_WATCH_TS"
 }
 
-# 只保留窗口内失败记录，旧故障不会无限累加触发重装。
-restart_prune() {
-    local now=$1 stamp kept="" count=0
-    local IFS=,
-    for stamp in ${RESTART_TS:-}; do
-        if [[ "$stamp" =~ ^[0-9]+$ ]] && [ "$((now-stamp))" -lt "$RESTART_WINDOW" ]; then
-            kept+="${kept:+,}$stamp"; count=$((count+1))
-        fi
-    done
-    RESTART_TS=$kept; RESTART_COUNT=$count
-}
-
-# 远端探针有有限重试；健康结果不生成上报请求。
-remote_probe_retries() {
-    local i tries=${1:-$PROBE_RETRIES}
-    for ((i=0;i<tries;i++)); do
-        [ "${STOP:-0}" != 1 ] || return 1
-        if edge_ready; then
-            if ws_probe "https://$DOMAIN$WS_PATH"; then return 0; else probe_log 远端; fi
-        else
-            WS_LAST_CODE=000; agent_log WARN "边缘未就绪: /ready 非 200"
-        fi
-        [ "$i" -ge "$((tries-1))" ] || agent_sleep 10 || return 1
-    done
-    return 1
-}
-
-# 重装重新生成身份信息并保持节点 id；固定 token 端口由控制台决定故保持。
-full_reinstall() {
+# 每轮只判断一次连接，任一失败直接交给隧道重建，不重试探测。
+remote_probe_once() {
     [ "${STOP:-0}" != 1 ] || return 1
-    local oldport=$PORT json chosen
-    agent_log WARN "执行完整重装: 更新端口/UUID/路径（固定 token 保持源端口）"
-    svc_stop "$SVC_ARGO" "$SVC_ARGO"; svc_stop "$SVC_SB" "$SVC_SB"
-    if [ "$MODE" = fixed ] && [ -s "$ARGO_TOKEN_FILE" ]; then
-        # 没有 Cloudflare 管理 API 密钥，换源端口会让固定 token 隧道永久 502。
-        chosen=$(pick_free_port "$oldport") || { agent_log ERR "固定源端口 $oldport 仍被占用，无法自动重装"; return 4; }
-    else
-        # 完整重装应换一个端口，随机选择恰好命中旧端口时再选，仍有上限。
-        local i
-        for ((i=0;i<50;i++)); do
-            chosen=$(pick_free_port) || return 4
-            [ "$chosen" = "$oldport" ] || break
-        done
-        [ "$chosen" != "$oldport" ] || return 4
+    if ! svc_running "$SVC_ARGO" "$SVC_ARGO"; then
+        agent_log WARN "cloudflared 未运行"; return 1
     fi
-    PORT=$chosen; UUID=$(rand_uuid); WS_PATH="/vmess-$(rand_token)"
-    env_set "$AGENT_ENV" PORT "$PORT"; env_set "$AGENT_ENV" UUID "$UUID"; env_set "$AGENT_ENV" PATH "$WS_PATH"
-    # 固定域名相同也要补发更新后的凭据，不能只比较域名判断。
-    env_set "$AGENT_ENV" LAST_REPORTED_DOMAIN ""; LAST_REPORTED_DOMAIN=""
-    install_cloudflared && install_singbox_core || return 3
-    [ "${STOP:-0}" != 1 ] || return 1
-    if [ "$MODE" = fixed ] && [ -s "$TUNNEL_JSON" ]; then json=$(cat "$TUNNEL_JSON"); argo_write_creds "$json" "$DOMAIN" "$PORT" || return 1; fi
-    metrics_port_ensure || return $?
-    sb_write_config "$PORT" "$UUID" "$WS_PATH" && sb_service_up || return 1
-    : > "$ARGO_LOG"; argo_service_configure || return 1
-    local d
-    wait_new_domain "" 90 >/dev/null || return 5
-    d=$WAIT_DOMAIN
-    DOMAIN=$d; env_set "$AGENT_ENV" DOMAIN "$DOMAIN"; env_set "$AGENT_ENV" LAST_DOMAIN_TS "$(date +%s)"
-    nodes_refresh
-    RESTART_TS=""
-    report_node || true
+    if [ -z "$DOMAIN" ]; then
+        agent_log WARN "当前隧道没有域名"; return 1
+    fi
+    if ! edge_ready; then
+        agent_log WARN "CF 连接未就绪"; return 1
+    fi
+    if ws_probe "https://$DOMAIN$WS_PATH"; then return 0; fi
+    probe_log 远端
+    return 1
 }
 
 # 启动时先确保依赖，再从当前进程获取域名；已有相同上报不写 Worker。
@@ -1545,7 +1603,7 @@ agent_startup() {
     if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_node || true; fi
 }
 
-# A 仅调用本机 metrics；待补发节点用 LAST_REPORTED_DOMAIN 判断，固定也可补发。
+# 自定义同步周期早于连接检查时，仅同步当前域名与待补发的变化。
 agent_watch() {
     local now=$1 d
     if [ "$MODE" = quick ]; then
@@ -1566,45 +1624,47 @@ agent_watch() {
     LAST_WATCH_TS=$now
 }
 
-# B 每两小时体检，故障先分辨本地入站，再决定隧道重启或完整重装。
+# 每两小时检查一次，连接失败直接重启 cloudflared，取得新域名后上报。
 agent_check() {
-    local now=$1 before=$DOMAIN reinstalled=0 recovered=1
-    restart_prune "$now"
-    if ! svc_running "$SVC_SB" "$SVC_SB"; then svc_restart "$SVC_SB" "$SVC_SB" || true; agent_sleep 3 || return 1; fi
-    if ! svc_running "$SVC_ARGO" "$SVC_ARGO"; then argo_restart_controlled || true; fi
-    if remote_probe_retries; then
-        # 健康时只补发之前失败或 B1 获取到新域名的变化，正常没有 POST。
+    local now=$1 d
+    LAST_CHECK_TS=$now; LAST_WATCH_TS=$now
+    # 自动拉起的 cloudflared 可能已有新域名，先读取当前进程再检查外网连接。
+    if svc_running "$SVC_ARGO" "$SVC_ARGO"; then
+        d=$(get_domain 9>&-)
+        if [ -n "$d" ] && [ "$d" != "$DOMAIN" ]; then
+            agent_log INFO "域名变化: $DOMAIN -> $d"
+            DOMAIN=$d; env_set "$AGENT_ENV" DOMAIN "$DOMAIN"; env_set "$AGENT_ENV" LAST_DOMAIN_TS "$now"
+            nodes_refresh
+        fi
+    fi
+    if remote_probe_once; then
+        # 连接正常时仅补发已知变化，不重复上传相同节点。
         if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_node || true; fi
-        LAST_CHECK_TS=$now; return 0
+        return 0
     fi
     [ "${STOP:-0}" != 1 ] || return 1
-    if [ "$RESTART_COUNT" -ge "$RESTART_BUDGET" ]; then
-        full_reinstall || recovered=0; reinstalled=1
+    agent_log WARN "CF 连接检查失败，立即重建隧道"
+    # 源服务停止或不通时一并拉起，保持原端口、UUID 和路径。
+    if ! svc_running "$SVC_SB" "$SVC_SB"; then
+        svc_restart "$SVC_SB" "$SVC_SB" || sb_service_up || agent_log ERR "sing-box 启动失败"
+        agent_sleep 3 || return 1
     elif ! ws_probe "http://127.0.0.1:$PORT$WS_PATH"; then
-        # 本地不通先单独恢复 sing-box，避免无必要地更换隧道域名。
-        probe_log 本地; svc_restart "$SVC_SB" "$SVC_SB" || true; agent_sleep 3 || return 1
-        if ! ws_probe "http://127.0.0.1:$PORT$WS_PATH"; then full_reinstall || recovered=0; reinstalled=1; fi
-    else
-        argo_restart_controlled || recovered=0
+        probe_log 本地
+        svc_restart "$SVC_SB" "$SVC_SB" || agent_log ERR "sing-box 重启失败"
+        agent_sleep 3 || return 1
+    fi
+    if ! argo_restart_controlled; then
+        agent_log ERR "本轮隧道重建未完成，下一轮按 ${CHECK_INTERVAL}s 周期检查"
+        return 1
     fi
     [ "${STOP:-0}" != 1 ] || return 1
-    if [ "$recovered" = 1 ] && remote_probe_retries 3; then
-        if [ "$DOMAIN" != "$before" ] || [ "$reinstalled" = 1 ] || [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then
-            # full_reinstall 已尝试一次；成功后不再重复上传同一节点。
-            [ "$DOMAIN" = "$LAST_REPORTED_DOMAIN" ] || report_node || true
+    # 新域名取得后立即同步，不再对新域名重复执行外网探测。
+    if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then
+        if ! report_node; then
+            agent_log WARN "新域名已取得，但上报失败，保留待补发状态"
         fi
-        agent_log INFO "远端自检恢复成功: $DOMAIN"
-        LAST_CHECK_TS=$now
-    else
-        agent_log ERR "恢复后仍无法连接，10 分钟后再试"
-        RESTART_TS+="${RESTART_TS:+,}$now"
-        restart_prune "$now"
-        if [ "$RESTART_COUNT" -ge "$RESTART_BUDGET" ] && [ "$reinstalled" != 1 ]; then
-            # 第五次失败当轮重装，不再额外等待下一次两小时检查。
-            if full_reinstall && remote_probe_retries 3; then LAST_CHECK_TS=$now; return 0; fi
-        fi
-        LAST_CHECK_TS=$((now-CHECK_INTERVAL+600))
     fi
+    return 0
 }
 
 # 锁 FD 必须在整个守护生命周期持有，单独 flock 命令的临时重定向会过早释放。
@@ -1615,7 +1675,7 @@ agent_lock_acquire() {
     flock -n 9 || { exec 9>&-; return 10; }
 }
 
-# once 复用完整启动与体检路径，强制一次远端检查供手工调试。
+# once 复用启动与连接检查路径，手动检查时也按单次失败立即重建。
 agent_once() {
     local rc
     STOP=0; trap 'STOP=1' TERM INT
@@ -1638,11 +1698,14 @@ agent_loop_body() {
     WATCH_EMPTY_WARNED=0
     agent_state_load
     agent_startup || return 1
-    agent_log INFO "守护启动: 自检 ${CHECK_INTERVAL}s，本地监视 ${WATCH_INTERVAL}s"
+    agent_log INFO "CF 连接检查启动: 每 ${CHECK_INTERVAL}s 检查，失败立即重建并上报新域名"
     while [ "$STOP" != 1 ]; do
         now=$(date +%s)
-        if [ "$WATCH_INTERVAL" -gt 0 ] && [ "$((now-LAST_WATCH_TS))" -ge "$WATCH_INTERVAL" ]; then agent_watch "$now"; fi
-        if [ "$STOP" != 1 ] && [ "$((now-LAST_CHECK_TS))" -ge "$CHECK_INTERVAL" ]; then agent_check "$now"; fi
+        if [ "$((now-LAST_CHECK_TS))" -ge "$CHECK_INTERVAL" ]; then
+            agent_check "$now"
+        elif [ "$WATCH_INTERVAL" -gt 0 ] && [ "$((now-LAST_WATCH_TS))" -ge "$WATCH_INTERVAL" ]; then
+            agent_watch "$now"
+        fi
         agent_state_save
         agent_sleep 5 || break
     done
@@ -1776,7 +1839,7 @@ agent_start() {
 agent_status() {
     printf 'sing-box: %s\ncloudflared: %s\nagent: %s\n' "$(svc_state "$SVC_SB" "$SVC_SB")" "$(svc_state "$SVC_ARGO" "$SVC_ARGO")" "$(svc_state "$SVC_AGENT" "$SVC_AGENT")"
     if [ -f "$AGENT_ENV" ]; then
-        printf '域名: %s\n自检: %ss | 本地监视: %ss\n上次成功上报: %s\n' "$(env_get "$AGENT_ENV" DOMAIN)" "$(env_get "$AGENT_ENV" CHECK_INTERVAL)" "$(env_get "$AGENT_ENV" WATCH_INTERVAL)" "$(env_get "$AGENT_ENV" LAST_REPORT_TS)"
+        printf '域名: %s\nCF 连接检查: 每 %ss，失败立即重建并上报新域名\n上次成功上报: %s\n' "$(env_get "$AGENT_ENV" DOMAIN)" "$(env_get "$AGENT_ENV" CHECK_INTERVAL)" "$(env_get "$AGENT_ENV" LAST_REPORT_TS)"
     fi
     if [ "$TUNEL_SYSTEM" != 1 ]; then
         printf '便携目录: %s\n' "$TUNEL_HOME"
@@ -1865,10 +1928,17 @@ main_menu() {
         env_line
         c=$(ask "请选择: " "0")
         case "$c" in
-            1) p=$(ask "本地端口（回车随机）: " ""); install_quick "$p" ;;
+            1)
+                if install_paths_preflight menu-install; then
+                    env_detect
+                    p=$(ask "本地端口（回车随机）: " ""); install_quick "$p"
+                fi ;;
             2)
-                d=$(ask "绑定域名: " ""); cred=$(ask "隧道 token 或 JSON 全文: " "")
-                p=$(ask "本地端口（回车随机）: " ""); install_fixed "$p" "$d" "$cred" ;;
+                if install_paths_preflight menu-install; then
+                    env_detect
+                    d=$(ask "绑定域名: " ""); cred=$(ask "隧道 token 或 JSON 全文: " "")
+                    p=$(ask "本地端口（回车随机）: " ""); install_fixed "$p" "$d" "$cred"
+                fi ;;
             3) tunnel_refresh_domain ;;
             4) show_node ;;
             5) yn=$(ask "确认卸载? (y/N): " N); case "$yn" in [Yy]*) uninstall_all; return ;; esac ;;
@@ -1884,6 +1954,7 @@ main_menu() {
 # 主入口：只读子命令无需 root，所有写系统目录的动作先检查权限。
 main() {
     parse_args "$@" || return $?
+    install_paths_preflight || return $?
     env_detect
     case "$COMMAND" in
         help|version|node|report|restart|uninstall|menu|quick|fixed|run)
@@ -1905,7 +1976,7 @@ main() {
     if [ "$TUNEL_SYSTEM" = 1 ] && [ "$EUID" != 0 ]; then
         echo "错误: 系统安装需要 root，普通用户请使用 TUNEL_HOME 专用目录。" >&2; return 1
     fi
-    [ "$COMMAND" = uninstall ] || runtime_dirs_ensure || return $?
+    case "$COMMAND" in uninstall|menu) : ;; *) runtime_dirs_ensure || return $? ;; esac
     case "$COMMAND" in
         menu) main_menu ;;
         quick) install_quick "$OPT_PORT" ;;
