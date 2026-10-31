@@ -1,0 +1,14 @@
+name = "tunel-sub"
+main = "_worker.js"
+compatibility_date = "2026-01-01"
+
+# 先创建 KV namespace，将占位符替换成实际 ID；不要提交 secret。
+[[kv_namespaces]]
+binding = "TUNEL_KV"
+id = "<填你的 KV namespace id>"
+
+[vars]
+SUBAPI = "https://clawsub.7979.pp.ua"
+SUBCONFIG = "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/config/ACL4SSR_Online_Mini_MultiMode.ini"
+SUBNAME = "tunel"
+CFIP = ""

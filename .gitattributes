@@ -1,0 +1,2 @@
+# Linux 执行入口必须保留 LF，避免 Windows autocrlf 生成不可执行的脚本。
+*.sh text eol=lf
