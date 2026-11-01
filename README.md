@@ -121,8 +121,8 @@ stop_grace_period: 45s
 | `--name X` | 记录标识字段，不改变国家地区显示名称 |
 | `--node-id ID` | 自定义 4–64 位字母、数字、下划线或短横线；克隆机器需独立 ID |
 | `--cfip H` | 单一连接 IP / 域名；批量地址使用面板 CFIP |
-| `--check-interval S` | 连接检查周期，默认 7200，范围 300–86400 秒 |
-| `--watch-interval S` | 域名同步周期，默认 7200；0 关闭额外同步，或 15–86400 秒 |
+| `--check-interval S` | 连接检查周期，默认 300（5 分钟），范围 300–86400 秒 |
+| `--watch-interval S` | 域名同步周期，默认 60（1 分钟）；0 关闭额外同步，或 15–86400 秒 |
 | `--no-agent` | 不启动后台守护；配置了上报时仍首次上报，容器可随后启动 run |
 | `-y` / `--yes` | 非交互安装 |
 
@@ -139,23 +139,25 @@ stop_grace_period: 45s
 | `tunel config K=V ...` | 修改配置 |
 | `tunel version` / `tunel help` | 版本 / 完整用法 |
 
-config 支持 REPORT_URL、REPORT_TOKEN、NODE_NAME、CFIP、CHECK_INTERVAL、WATCH_INTERVAL。已有安装可用 `tunel config CHECK_INTERVAL=7200 WATCH_INTERVAL=7200` 更新周期；重新 quick / fixed 安装时，未显式指定的周期恢复默认值。
+config 支持 REPORT_URL、REPORT_TOKEN、NODE_NAME、CFIP、CHECK_INTERVAL、WATCH_INTERVAL。重新 quick / fixed 安装时，未显式指定的周期恢复默认值：连接检查 300 秒、域名同步 60 秒。
 
 ### 更新已有安装
 
-root 默认系统安装执行：
+已有安装先更新脚本，再应用新周期。root 默认系统安装执行：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh | bash -s -- agent start
+tunel config CHECK_INTERVAL=300 WATCH_INTERVAL=60
 ```
 
 用户或便携安装须沿用原 TUNEL_HOME；默认用户目录例如：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh | TUNEL_HOME="$HOME/.local/share/tunel" bash -s -- agent start
+"$HOME/.local/share/tunel/bin/tunel" config CHECK_INTERVAL=300 WATCH_INTERVAL=60
 ```
 
-自定义目录将示例路径换成原目录。更新会刷新本地脚本和相应的服务自启配置，保留既有 UUID、端口、路径与上报配置，无需重新填写上报 token；更新后的守护立即检查，连接失效时按恢复策略重建。
+自动兜底或自定义目录将两处示例路径都换成原目录。脚本更新会刷新本地脚本和相应的服务自启配置，保留既有 UUID、端口、路径、上报配置及已有周期；第二步 config 才应用新周期，无需重新填写上报 token。更新后的守护立即检查，连接失效时按恢复策略重建。
 
 ## 日常使用
 
@@ -163,7 +165,7 @@ curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh | TUNEL_
 
 设置页 CFIP 支持换行或逗号分隔的 IP / 域名及可选端口，默认端口 443；指定 IPv6 端口时使用 `[IPv6]:端口`。保存空 CFIP 会关闭自定义连接地址，不再回退环境变量；CFIP 不改变国家地区名称。
 
-每次守护启动立即检查连接，每轮最多探测 3 次，失败探测之间间隔 10 秒，连续 3 次失败才重建隧道。重建失败后约 10 分钟重试；上报失败也会在约 10 分钟后重新检查并补发。恢复后按默认 2 小时周期检查，域名同步默认也为 2 小时，临时隧道换域名后会同步到订阅。
+每次守护启动立即检查连接，每轮最多探测 3 次，失败探测之间间隔 10 秒，连续 3 次失败才重建隧道。重建失败后约 5 分钟重试；上报失败也会在约 5 分钟后重新检查并补发。恢复后按默认 5 分钟周期检查，域名同步默认每 1 分钟执行，临时隧道换域名后会同步到订阅。
 
 Worker 不判断服务器是否在线，也不会自动删除离线记录。Quick Tunnel 没有可用性保证，长期使用建议固定隧道。
 

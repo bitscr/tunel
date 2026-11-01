@@ -42,7 +42,11 @@ esac
 # 版本固化：只从本仓库 vendor 下载，sha256 必须与 vendor/SHA256SUMS 一致
 # ============================================================================
 TUNEL_VERSION="0.0.1"
-DEFAULT_CHECK_INTERVAL=7200
+DEFAULT_CHECK_INTERVAL=300
+DEFAULT_WATCH_INTERVAL=60
+RECOVERY_RETRY_INTERVAL=300
+REPORT_RETRY_AFTER=0
+REPORT_RETRY_DOMAIN=""
 LOCATION_MEMORY_ATTEMPT_TS=0
 VENDOR_CF_TAG="2026.10.7"
 VENDOR_SB_TAG="1.14.4"
@@ -804,7 +808,7 @@ agent_load() {
     CFIP=$(env_get "$AGENT_ENV" CFIP); REPORT_URL=$(env_get "$AGENT_ENV" REPORT_URL)
     REPORT_TOKEN=$(env_get "$AGENT_ENV" REPORT_TOKEN)
     CHECK_INTERVAL=$(env_get "$AGENT_ENV" CHECK_INTERVAL); CHECK_INTERVAL=${CHECK_INTERVAL:-$DEFAULT_CHECK_INTERVAL}
-    WATCH_INTERVAL=$(env_get "$AGENT_ENV" WATCH_INTERVAL); WATCH_INTERVAL=${WATCH_INTERVAL:-$DEFAULT_CHECK_INTERVAL}
+    WATCH_INTERVAL=$(env_get "$AGENT_ENV" WATCH_INTERVAL); WATCH_INTERVAL=${WATCH_INTERVAL:-$DEFAULT_WATCH_INTERVAL}
     CORE_LOGS=$(env_get "$AGENT_ENV" CORE_LOGS); CORE_LOGS=${CORE_LOGS:-1}
     COUNTRY=$(env_get "$AGENT_ENV" COUNTRY); location_country_valid "$COUNTRY" || COUNTRY=""
     REGION=$(env_get "$AGENT_ENV" REGION); [[ "$REGION" =~ ^[A-Za-z0-9_-]{1,16}$ ]] || REGION=""
@@ -856,7 +860,8 @@ agent_env_ensure() {
             # 默认值集中在这里，迁移与全新安装得到相同配置。
             case "$k" in
                 NODE_ID) value=$(default_node_id) ;; NODE_NAME) value=$(node_name_clean "$(hostname -s)") ;;
-                CHECK_INTERVAL|WATCH_INTERVAL) value=$DEFAULT_CHECK_INTERVAL ;; CORE_LOGS) value=1 ;; *) value=0 ;;
+                CHECK_INTERVAL) value=$DEFAULT_CHECK_INTERVAL ;; WATCH_INTERVAL) value=$DEFAULT_WATCH_INTERVAL ;;
+                CORE_LOGS) value=1 ;; *) value=0 ;;
             esac
             env_set "$AGENT_ENV" "$k" "$value" || return 1
         fi
@@ -1002,8 +1007,8 @@ help() {
   version | help
 安装选项（支持 --k=v）:
   --port N --name X --cfip H --node-id ID
-  --report-url U --report-token T --check-interval S (300–86400，默认7200)
-  --watch-interval S (0 或15–86400，默认7200) --no-agent -y/--yes
+  --report-url U --report-token T --check-interval S (300–86400，默认300)
+  --watch-interval S (0 或15–86400，默认60) --no-agent -y/--yes
 可用环境变量: TUNEL_NODE_NAME TUNEL_CFIP TUNEL_NODE_ID
               TUNEL_REPORT_URL TUNEL_REPORT_TOKEN
               TUNEL_HOME（普通用户默认 $HOME/.local/share/tunel）
@@ -1930,6 +1935,21 @@ report_node() {
     return 1
 }
 
+# 自动补发按域名共享退避，新域名可立即上报，手动 report 不受此限制。
+report_pending() {
+    [ -n "${REPORT_URL:-}" ] && [ -n "${DOMAIN:-}" ] && [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ] || return 0
+    local now
+    now=$(date +%s)
+    if [ "$DOMAIN" = "$REPORT_RETRY_DOMAIN" ] && [ "$now" -lt "$REPORT_RETRY_AFTER" ]; then return 0; fi
+    if report_node; then
+        REPORT_RETRY_DOMAIN=""; REPORT_RETRY_AFTER=0
+        return 0
+    fi
+    REPORT_RETRY_DOMAIN=$DOMAIN
+    REPORT_RETRY_AFTER=$(($(date +%s)+RECOVERY_RETRY_INTERVAL))
+    return 1
+}
+
 # 注销只在卸载时调用，网络失败记录后继续本地清理。
 report_delete() {
     agent_load
@@ -1980,7 +2000,7 @@ dependencies_ensure() {
     done
 }
 
-# 保存本次安装身份；上报配置可沿用旧值，未指定的检查周期统一为两小时。
+# 保存本次安装身份；上报配置可沿用旧值，未指定的检查与域名同步周期使用各自默认值。
 install_env_write() {
     local key val
     env_set "$AGENT_ENV" MODE "$MODE"
@@ -1996,7 +2016,7 @@ install_env_write() {
             NAME) val=${OPT_NAME:-}; key=NODE_NAME ;; CFIP) val=${OPT_CFIP:-} ;;
             NODE_ID) val=${OPT_NODE_ID:-} ;; REPORT_URL) val=${OPT_REPORT_URL:-} ;; REPORT_TOKEN) val=${OPT_REPORT_TOKEN:-} ;;
             CHECK) val=${OPT_CHECK:-$DEFAULT_CHECK_INTERVAL}; key=CHECK_INTERVAL ;;
-            WATCH) val=${OPT_WATCH:-$DEFAULT_CHECK_INTERVAL}; key=WATCH_INTERVAL ;;
+            WATCH) val=${OPT_WATCH:-$DEFAULT_WATCH_INTERVAL}; key=WATCH_INTERVAL ;;
         esac
         [ -z "$val" ] || env_set "$AGENT_ENV" "$key" "$val" || return 1
     done
@@ -2167,7 +2187,7 @@ agent_startup() {
         nodes_refresh
     fi
     location_refresh
-    if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_node || true; fi
+    if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_pending || true; fi
 }
 
 # 自定义同步周期早于连接检查时，仅同步当前域名与待补发的变化。
@@ -2187,11 +2207,11 @@ agent_watch() {
         fi
     fi
     # 上报失败不会更新 LAST_REPORTED_DOMAIN，这里只补发已知变更，不是心跳。
-    if [ -n "$DOMAIN" ] && [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_node || true; fi
+    if [ -n "$DOMAIN" ] && [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_pending || true; fi
     LAST_WATCH_TS=$now
 }
 
-# 默认每两小时检查，连续三次失败才重建，重建失败十分钟后再试。
+# 默认每五分钟检查，连续三次失败才重建，重建或上报失败五分钟后再试。
 agent_check() {
     local now=$1 d attempt ok=0
     LAST_CHECK_TS=$now; LAST_WATCH_TS=$now
@@ -2213,9 +2233,9 @@ agent_check() {
     if [ "$ok" = 1 ]; then
         location_refresh
         # 连接正常时仅补发已知变化，不重复上传相同节点。
-        if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ] && ! report_node; then
-            LAST_CHECK_TS=$(($(date +%s)-CHECK_INTERVAL+600))
-            agent_log WARN "连接已恢复，但上报失败，600s 后重新检查并补发"
+        if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ] && ! report_pending; then
+            LAST_CHECK_TS=$(($(date +%s)-CHECK_INTERVAL+RECOVERY_RETRY_INTERVAL))
+            agent_log WARN "连接已恢复，但上报失败，${RECOVERY_RETRY_INTERVAL}s 后重新检查并补发"
         fi
         return 0
     fi
@@ -2232,17 +2252,17 @@ agent_check() {
     fi
     if ! argo_restart_controlled; then
         [ "${STOP:-0}" != 1 ] || return 1
-        LAST_CHECK_TS=$(($(date +%s)-CHECK_INTERVAL+600))
-        agent_log ERR "本轮隧道重建未完成，600s 后重试"
+        LAST_CHECK_TS=$(($(date +%s)-CHECK_INTERVAL+RECOVERY_RETRY_INTERVAL))
+        agent_log ERR "本轮隧道重建未完成，${RECOVERY_RETRY_INTERVAL}s 后重试"
         return 1
     fi
     [ "${STOP:-0}" != 1 ] || return 1
     location_refresh
     # 新域名取得后立即同步，不再对新域名重复执行外网探测。
     if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then
-        if ! report_node; then
-            LAST_CHECK_TS=$(($(date +%s)-CHECK_INTERVAL+600))
-            agent_log WARN "新域名已取得，但上报失败，600s 后重新检查并补发"
+        if ! report_pending; then
+            LAST_CHECK_TS=$(($(date +%s)-CHECK_INTERVAL+RECOVERY_RETRY_INTERVAL))
+            agent_log WARN "新域名已取得，但上报失败，${RECOVERY_RETRY_INTERVAL}s 后重新检查并补发"
         fi
     fi
     return 0
@@ -2282,10 +2302,10 @@ agent_loop_body() {
     RESOURCE_LAST_MAINTENANCE_TS=0
     resource_maintenance "$(date +%s)"
     agent_startup || return 1
-    # 每次启动都检查当前连接，开机网络未就绪不能沿用上次运行的两小时等待。
+    # 每次启动都检查当前连接，开机网络未就绪不能沿用上次运行的检查等待。
     agent_log INFO "守护启动，立即检查当前连接并同步域名"
     agent_check "$(date +%s)"
-    agent_log INFO "CF 连接检查启动: 每 ${CHECK_INTERVAL}s 检查，连续 3 次失败后重建，重建失败 600s 后重试"
+    agent_log INFO "CF 连接检查启动: 每 ${CHECK_INTERVAL}s 检查，域名同步每 ${WATCH_INTERVAL}s，连续 3 次失败后重建，重建失败 ${RECOVERY_RETRY_INTERVAL}s 后重试"
     while [ "$STOP" != 1 ]; do
         now=$(date +%s)
         resource_maintenance "$now"
@@ -2427,7 +2447,7 @@ agent_status() {
     if [ -f "$AGENT_ENV" ]; then
         display_domain=$(env_get "$AGENT_ENV" DOMAIN); status_mode=$(env_get "$AGENT_ENV" MODE)
         if [ "$status_mode" = quick ] && ! quick_domain_valid "$display_domain"; then display_domain="未取得有效临时隧道域名"; fi
-        printf '域名: %s\nCF 连接检查: 每 %ss，连续 3 次失败后重建，重建失败 600s 后重试\n上次成功上报: %s\n' "$display_domain" "$(env_get "$AGENT_ENV" CHECK_INTERVAL)" "$(env_get "$AGENT_ENV" LAST_REPORT_TS)"
+        printf '域名: %s\nCF 连接检查: 每 %ss，域名同步每 %ss，连续 3 次失败后重建，重建失败 %ss 后重试\n上次成功上报: %s\n' "$display_domain" "$(env_get "$AGENT_ENV" CHECK_INTERVAL)" "$(env_get "$AGENT_ENV" WATCH_INTERVAL)" "$RECOVERY_RETRY_INTERVAL" "$(env_get "$AGENT_ENV" LAST_REPORT_TS)"
     fi
     if [ "$TUNEL_SYSTEM" != 1 ]; then
         printf '便携目录: %s\n' "$TUNEL_HOME"
