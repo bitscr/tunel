@@ -42,18 +42,17 @@ esac
 # 版本固化：只从本仓库 vendor 下载，sha256 必须与 vendor/SHA256SUMS 一致
 # ============================================================================
 TUNEL_VERSION="0.0.1"
-DEFAULT_CHECK_INTERVAL=3600
-DEFAULT_WATCH_INTERVAL=60
-RECOVERY_RETRY_INTERVAL=300
-PROCESS_CHECK_INTERVAL=30
-PROCESS_RECOVERY_RETRY_AFTER=0
+AUTOMATIC_INTERVAL=3600
+DEFAULT_CHECK_INTERVAL=$AUTOMATIC_INTERVAL
+DEFAULT_WATCH_INTERVAL=$AUTOMATIC_INTERVAL
+RECOVERY_RETRY_INTERVAL=$AUTOMATIC_INTERVAL
+RECOVERY_RETRY_AFTER=0
 AGENT_ACTIVE=0
 DOMAIN_SYNC_PENDING=0
 ARGO_REBUILD_PENDING=0
 ARGO_FAILED_DOMAIN=""
 REPORT_RETRY_AFTER=0
 REPORT_RETRY_DOMAIN=""
-REPORT_RETRY_POLL_AFTER=0
 LOCATION_MEMORY_ATTEMPT_TS=0
 VENDOR_CF_TAG="2026.10.7"
 VENDOR_SB_TAG="1.14.4"
@@ -446,14 +445,14 @@ http_fetch() { # $1=url $2=输出文件
     if has curl; then
         # curl 能显式拒绝 HTTP 4xx/5xx，并控制连接与整次下载时间。
         if [ "${RUN_ACTIVE:-0}" = 1 ] || [ "$AGENT_ACTIVE" = 1 ]; then
-            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 --max-filesize "$__tunel_fetch_limit" -o "$2" "$1" 7>&- 9>&- &
+            curl -fsSL --retry 0 --connect-timeout 15 --max-time 600 --max-filesize "$__tunel_fetch_limit" -o "$2" "$1" 7>&- 9>&- &
         else
             curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 --max-filesize "$__tunel_fetch_limit" -o "$2" "$1" 9>&-
             return $?
         fi
     elif has wget; then
         # 保留只有 wget 的 minimal 系统下载兼容。
-        if [ "${RUN_ACTIVE:-0}" = 1 ] || [ "$AGENT_ACTIVE" = 1 ]; then wget -q -T 30 -t 3 -O "$2" "$1" 7>&- 9>&- &
+        if [ "${RUN_ACTIVE:-0}" = 1 ] || [ "$AGENT_ACTIVE" = 1 ]; then wget -q -T 30 -t 1 -O "$2" "$1" 7>&- 9>&- &
         else wget -q -T 30 -t 3 -O "$2" "$1" 9>&-; return $?; fi
     else
         # 不假装下载成功，调用者会返回依赖失败退出码。
@@ -803,8 +802,7 @@ setting_valid() {
         REPORT_TOKEN) [ -n "$val" ] ;;
         NODE_NAME) [[ "$val" =~ ^[A-Za-z0-9._-]{1,64}$ ]] ;;
         CFIP) [[ -z "$val" || "$val" =~ ^[A-Za-z0-9.:-]+$ ]] ;;
-        CHECK_INTERVAL) [[ "$val" =~ ^[0-9]{1,5}$ ]] && ((10#$val >= 300 && 10#$val <= 86400)) ;;
-        WATCH_INTERVAL) [[ "$val" =~ ^[0-9]{1,5}$ ]] && ((10#$val == 0 || (10#$val >= 15 && 10#$val <= 86400))) ;;
+        CHECK_INTERVAL|WATCH_INTERVAL) [ "$val" = "$AUTOMATIC_INTERVAL" ] ;;
         *) return 1 ;; # 白名单拒绝覆盖 MODE/UUID/PATH 等运行身份字段。
     esac
 }
@@ -817,8 +815,10 @@ agent_load() {
     NODE_ID=$(env_get "$AGENT_ENV" NODE_ID); NODE_NAME=$(env_get "$AGENT_ENV" NODE_NAME)
     CFIP=$(env_get "$AGENT_ENV" CFIP); REPORT_URL=$(env_get "$AGENT_ENV" REPORT_URL)
     REPORT_TOKEN=$(env_get "$AGENT_ENV" REPORT_TOKEN)
-    CHECK_INTERVAL=$(env_get "$AGENT_ENV" CHECK_INTERVAL); CHECK_INTERVAL=${CHECK_INTERVAL:-$DEFAULT_CHECK_INTERVAL}
-    WATCH_INTERVAL=$(env_get "$AGENT_ENV" WATCH_INTERVAL); WATCH_INTERVAL=${WATCH_INTERVAL:-$DEFAULT_WATCH_INTERVAL}
+    CHECK_INTERVAL=$AUTOMATIC_INTERVAL; WATCH_INTERVAL=$AUTOMATIC_INTERVAL
+    REPORT_RETRY_DOMAIN=$(env_get "$AGENT_ENV" REPORT_RETRY_DOMAIN)
+    REPORT_RETRY_AFTER=$(env_get "$AGENT_ENV" REPORT_RETRY_AFTER)
+    [[ "$REPORT_RETRY_AFTER" =~ ^[0-9]{1,12}$ ]] || REPORT_RETRY_AFTER=0
     CORE_LOGS=$(env_get "$AGENT_ENV" CORE_LOGS); CORE_LOGS=${CORE_LOGS:-1}
     COUNTRY=$(env_get "$AGENT_ENV" COUNTRY); location_country_valid "$COUNTRY" || COUNTRY=""
     REGION=$(env_get "$AGENT_ENV" REGION); [[ "$REGION" =~ ^[A-Za-z0-9_-]{1,16}$ ]] || REGION=""
@@ -875,6 +875,10 @@ agent_env_ensure() {
             esac
             env_set "$AGENT_ENV" "$k" "$value" || return 1
         fi
+    done
+    # 旧安装的独立短周期也迁移为同一小时周期。
+    for k in CHECK_INTERVAL WATCH_INTERVAL; do
+        [ "$(env_get "$AGENT_ENV" "$k")" = "$AUTOMATIC_INTERVAL" ] || env_set "$AGENT_ENV" "$k" "$AUTOMATIC_INTERVAL" || return 1
     done
     chmod 600 "$AGENT_ENV"
     agent_load
@@ -1017,8 +1021,8 @@ help() {
   version | help
 安装选项（支持 --k=v）:
   --port N --name X --cfip H --node-id ID
-  --report-url U --report-token T --check-interval S (300–86400，默认3600)
-  --watch-interval S (0 或15–86400，默认60) --no-agent -y/--yes
+  --report-url U --report-token T --check-interval 3600
+  --watch-interval 3600（兼容旧参数，不再独立调度） --no-agent -y/--yes
 可用环境变量: TUNEL_NODE_NAME TUNEL_CFIP TUNEL_NODE_ID
               TUNEL_REPORT_URL TUNEL_REPORT_TOKEN
               TUNEL_HOME（普通用户默认 $HOME/.local/share/tunel）
@@ -1101,15 +1105,14 @@ svc_env_lines() {
 # 六七参数配置重启和网络依赖，第八参数允许更新自启配置而保留运行中的核心。
 svc_install() {
     local unit=$1 oname=$2 desc=$3 cmd=$4 logdir=$5 policy=${6:-on-failure} after=${7:-network-online.target nss-lookup.target} action=${8:-restart}
-    local envsh="" wants="Wants=network-online.target" delay=10
+    local envsh="" wants="Wants=network-online.target" delay=$AUTOMATIC_INTERVAL
     case "$action" in start|restart) : ;; *) return 2 ;; esac
     runtime_dirs_ensure || return 1
     mkdir -p -m 700 "$logdir" || return 1
     chmod 700 "$logdir"
     svc_wrapper "$oname" "$cmd" || return 1
     [ "$ENV_LOWMEM" != 1 ] || envsh=$(printf 'export GOGC=30\nexport GOMEMLIMIT=48MiB')
-    if [ "$policy" = always ]; then wants="Wants=network-online.target $SVC_SB.service $SVC_ARGO.service"; delay=15; fi
-    [ "$oname" != "$SVC_ARGO" ] || delay=$RECOVERY_RETRY_INTERVAL
+    if [ "$policy" = always ]; then wants="Wants=network-online.target $SVC_SB.service $SVC_ARGO.service"; fi
     case "$ENV_INIT" in
         systemd)
             [ "$TUNEL_SYSTEM" = 1 ] && [ "$EUID" = 0 ] || return 1
@@ -1137,8 +1140,7 @@ EOF
         openrc)
             [ "$TUNEL_SYSTEM" = 1 ] && [ "$EUID" = 0 ] || return 1
             # 新 openrc 由 supervisor 拉起崩溃进程，旧版保留 background 兼容。
-            local supervision respawn_delay=5
-            if [ "$oname" = "$SVC_ARGO" ] && [ "${CORE_LOGS:-1}" != 1 ]; then respawn_delay=$RECOVERY_RETRY_INTERVAL; fi
+            local supervision respawn_delay=$AUTOMATIC_INTERVAL
             if has supervise-daemon; then
                 supervision=$(printf 'supervisor="supervise-daemon"\nsupervise_daemon_args="--respawn-delay %s --respawn-max 0"' "$respawn_delay")
             else
@@ -1910,9 +1912,9 @@ location_refresh() {
         [ "$route_ok" = 1 ] && [ "$LOCATION_INTERFACE" = "$LOCATION_QUERY_INTERFACE" ] && [ "$LOCATION_METHOD" = "$LOCATION_QUERY_MODE" ] &&
         { [ "$LOCATION_QUERY_MODE" != ip ] || [ "$LOCATION_IP" = "$LOCATION_QUERY_IP" ]; }; then return 0; fi
     age=$((now-10#${LOCATION_ATTEMPT_TS:-0}))
-    if [ "${LOCATION_ATTEMPT_TS:-0}" != 0 ] && [ "$age" -ge 0 ] && [ "$age" -lt 300 ]; then return 0; fi
+    if [ "${LOCATION_ATTEMPT_TS:-0}" != 0 ] && [ "$age" -ge 0 ] && [ "$age" -lt "$AUTOMATIC_INTERVAL" ]; then return 0; fi
     age=$((now-10#$LOCATION_MEMORY_ATTEMPT_TS))
-    if [ "$LOCATION_MEMORY_ATTEMPT_TS" != 0 ] && [ "$age" -ge 0 ] && [ "$age" -lt 300 ]; then return 0; fi
+    if [ "$LOCATION_MEMORY_ATTEMPT_TS" != 0 ] && [ "$age" -ge 0 ] && [ "$age" -lt "$AUTOMATIC_INTERVAL" ]; then return 0; fi
     LOCATION_MEMORY_ATTEMPT_TS=$now
     for provider in ipinfo ip.sb ip-api ip-api-http worker; do
         [ "${STOP:-0}" != 1 ] || return 0
@@ -1967,7 +1969,7 @@ location_refresh() {
     [ -z "${DOMAIN:-}" ] || nodes_refresh || true
 }
 
-# 发送失败仅对 5xx/000 重试，不修改已上报标记，下一轮可补发。
+# 每轮上报只发送一次，失败保存下一小时的补发时间。
 report_node() {
     agent_load
     if [ "$MODE" = quick ] && ! quick_domain_valid "$DOMAIN"; then
@@ -1976,7 +1978,7 @@ report_node() {
     fi
     location_refresh
     [ -n "$REPORT_URL" ] || return 0
-    local body resp code now link attempt delay verified=false
+    local body resp code now link verified=false
     [ -n "$REPORT_TOKEN" ] && [ -n "$DOMAIN" ] || { agent_log ERR "上报配置缺少 token 或域名"; return 1; }
     umask 077
     body=$(mktemp) || return 1; resp=$(mktemp) || { rm -f "$body"; return 1; }
@@ -1985,31 +1987,29 @@ report_node() {
     [ "${LOCATION_VERIFIED:-0}" != 1 ] || verified=true
     printf '{"id":"%s","name":"%s","mode":"%s","link":"%s","host":"%s","addr":"%s","port":443,"uuid":"%s","path":"%s","country":"%s","region":"%s","regionName":"%s","locationVerified":%s,"net":"ws","tls":true,"sni":"%s","version":"%s","ts":%s}' \
         "$(json_escape "$NODE_ID")" "$(json_escape "$NODE_NAME")" "$MODE" "$(json_escape "$link")" "$DOMAIN" "$(json_escape "${CFIP:-$DOMAIN}")" "$UUID" "$(json_escape "$WS_PATH")" "${COUNTRY:-}" "${REGION:-}" "$(json_escape "${REGION_NAME:-}")" "$verified" "$DOMAIN" "$TUNEL_VERSION" "$now" > "$body"
-    for attempt in 0 1 2 3; do
-        [ "${STOP:-0}" != 1 ] || break
-        resource_maintenance "$(date +%s)"
-        code=$(exec 9>&-; curl -sS -m 15 --max-filesize 65536 -o "$resp" -w '%{http_code}' -X POST -H "Authorization: Bearer $REPORT_TOKEN" -H 'Content-Type: application/json' --data-binary "@$body" "$REPORT_URL" 9>&- 2>/dev/null)
-        code=${code:-000}
-        case "$code" in
-            200)
-                # skipped 也算成功，服务端已保存相同节点。
-                env_set "$AGENT_ENV" LAST_REPORT_TS "$(date +%s)"
-                env_set "$AGENT_ENV" LAST_REPORTED_DOMAIN "$DOMAIN"
-                LAST_REPORTED_DOMAIN=$DOMAIN
-                agent_log INFO "上报成功: $NODE_ID / $DOMAIN"
-                rm -f "$body" "$resp"; return 0 ;;
-            401) agent_log ERR "上报 token 被拒绝"; break ;;
-            4*) agent_log ERR "上报 HTTP $code: $(head -c 200 "$resp")"; break ;;
-            5*|000)
-                # 三段退避抑制短时错误，预算耗尽仍保留待补发身份。
-                if [ "$attempt" -eq 3 ]; then break; fi
-                case "$attempt" in 0) delay=5 ;; 1) delay=15 ;; 2) delay=45 ;; esac
-                agent_log WARN "上报 HTTP $code，${delay}s 后重试"
-                agent_sleep "$delay" || break ;;
-            *) agent_log ERR "上报返回非预期 HTTP $code"; break ;;
-        esac
-    done
-    agent_log ERR "上报失败: $NODE_ID / $DOMAIN（保留待补发状态）"
+    [ "${STOP:-0}" != 1 ] || { rm -f "$body" "$resp"; return 1; }
+    resource_maintenance "$(date +%s)"
+    code=$(exec 9>&-; curl -sS -m 15 --max-filesize 65536 -o "$resp" -w '%{http_code}' -X POST -H "Authorization: Bearer $REPORT_TOKEN" -H 'Content-Type: application/json' --data-binary "@$body" "$REPORT_URL" 9>&- 2>/dev/null)
+    code=${code:-000}
+    case "$code" in
+        200)
+            # skipped 也算成功，服务端已保存相同节点。
+            env_set "$AGENT_ENV" LAST_REPORT_TS "$(date +%s)"
+            env_set "$AGENT_ENV" LAST_REPORTED_DOMAIN "$DOMAIN"
+            env_set "$AGENT_ENV" REPORT_RETRY_DOMAIN ""
+            env_set "$AGENT_ENV" REPORT_RETRY_AFTER 0
+            LAST_REPORTED_DOMAIN=$DOMAIN; REPORT_RETRY_DOMAIN=""; REPORT_RETRY_AFTER=0
+            agent_log INFO "上报成功: $NODE_ID / $DOMAIN"
+            rm -f "$body" "$resp"; return 0 ;;
+        401) agent_log ERR "上报 token 被拒绝" ;;
+        4*) agent_log ERR "上报 HTTP $code: $(head -c 200 "$resp")" ;;
+        *) agent_log ERR "上报返回 HTTP $code" ;;
+    esac
+    REPORT_RETRY_DOMAIN=$DOMAIN
+    REPORT_RETRY_AFTER=$(($(date +%s)+RECOVERY_RETRY_INTERVAL))
+    env_set "$AGENT_ENV" REPORT_RETRY_DOMAIN "$REPORT_RETRY_DOMAIN"
+    env_set "$AGENT_ENV" REPORT_RETRY_AFTER "$REPORT_RETRY_AFTER"
+    agent_log ERR "上报失败: $NODE_ID / $DOMAIN（${RECOVERY_RETRY_INTERVAL}s 后补发）"
     rm -f "$body" "$resp"
     return 1
 }
@@ -2026,18 +2026,7 @@ report_pending() {
         REPORT_RETRY_DOMAIN=""; REPORT_RETRY_AFTER=0
         return 0
     fi
-    REPORT_RETRY_DOMAIN=$DOMAIN
-    REPORT_RETRY_AFTER=$(($(date +%s)+RECOVERY_RETRY_INTERVAL))
     return 1
-}
-
-# 补发独立于域名同步周期，不为上报失败重新测活。
-agent_report_retry() {
-    local now=$1
-    [ "$REPORT_RETRY_AFTER" -gt 0 ] && [ "$now" -ge "$REPORT_RETRY_AFTER" ] && [ "$now" -ge "$REPORT_RETRY_POLL_AFTER" ] || return 0
-    [ -n "${REPORT_URL:-}" ] && [ -n "${DOMAIN:-}" ] && [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ] || return 0
-    REPORT_RETRY_POLL_AFTER=$((now+PROCESS_CHECK_INTERVAL))
-    report_pending || true
 }
 
 # 注销只在卸载时调用，网络失败记录后继续本地清理。
@@ -2238,31 +2227,27 @@ tunnel_refresh_domain() {
 # 检查时间独立于配置，删除 state 后下一轮立即检查连接。
 agent_state_load() {
     LAST_CHECK_TS=$(env_get "$AGENT_STATE" LAST_CHECK_TS); LAST_CHECK_TS=${LAST_CHECK_TS:-0}
-    LAST_WATCH_TS=$(env_get "$AGENT_STATE" LAST_WATCH_TS); LAST_WATCH_TS=${LAST_WATCH_TS:-0}
     [[ "$LAST_CHECK_TS" =~ ^[0-9]{1,12}$ ]] || LAST_CHECK_TS=0
-    [[ "$LAST_WATCH_TS" =~ ^[0-9]{1,12}$ ]] || LAST_WATCH_TS=0
-    AGENT_STATE_SAVED_CHECK_TS=""; AGENT_STATE_SAVED_WATCH_TS=""; AGENT_STATE_RETRY_AFTER=0
+    AGENT_STATE_SAVED_CHECK_TS=""; AGENT_STATE_RETRY_AFTER=0
     if [ -f "$AGENT_STATE" ]; then
         AGENT_STATE_SAVED_CHECK_TS=$LAST_CHECK_TS
-        AGENT_STATE_SAVED_WATCH_TS=$LAST_WATCH_TS
     fi
 }
 
 # 时间未变化时不写盘；变化时一次原子保存，写失败也不每五秒反复创建临时文件。
 agent_state_save() {
     local now tmp
-    if [ -f "$AGENT_STATE" ] && [ "$LAST_CHECK_TS" = "${AGENT_STATE_SAVED_CHECK_TS:-}" ] && [ "$LAST_WATCH_TS" = "${AGENT_STATE_SAVED_WATCH_TS:-}" ]; then return 0; fi
+    if [ -f "$AGENT_STATE" ] && [ "$LAST_CHECK_TS" = "${AGENT_STATE_SAVED_CHECK_TS:-}" ]; then return 0; fi
     now=${1:-$(date +%s)}
     [ "$now" -ge "${AGENT_STATE_RETRY_AFTER:-0}" ] || return 0
     AGENT_STATE_RETRY_AFTER=$((now+RESOURCE_MAINTENANCE_INTERVAL))
     umask 077
     tmp=$(mktemp "$TMP_DIR/agent-state.XXXXXX") || return 1
-    if ! printf 'LAST_CHECK_TS=%s\nLAST_WATCH_TS=%s\n' "$LAST_CHECK_TS" "$LAST_WATCH_TS" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$AGENT_STATE"; then
+    if ! printf 'LAST_CHECK_TS=%s\n' "$LAST_CHECK_TS" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$AGENT_STATE"; then
         rm -f "$tmp"
         return 1
     fi
     AGENT_STATE_SAVED_CHECK_TS=$LAST_CHECK_TS
-    AGENT_STATE_SAVED_WATCH_TS=$LAST_WATCH_TS
     AGENT_STATE_RETRY_AFTER=0
     return 0
 }
@@ -2326,8 +2311,8 @@ agent_domain_sync() {
 agent_recovery_defer() {
     local now
     now=$(date +%s)
-    LAST_CHECK_TS=$((now-CHECK_INTERVAL+RECOVERY_RETRY_INTERVAL))
-    PROCESS_RECOVERY_RETRY_AFTER=$((now+RECOVERY_RETRY_INTERVAL))
+    LAST_CHECK_TS=$now
+    RECOVERY_RETRY_AFTER=$((now+RECOVERY_RETRY_INTERVAL))
     agent_log ERR "$1，${RECOVERY_RETRY_INTERVAL}s 后重试"
 }
 
@@ -2339,59 +2324,21 @@ agent_startup() {
         agent_recovery_defer "守护启动恢复未完成"
         return 0
     fi
-    location_refresh
-    if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_pending || true; fi
+    return 0
 }
 
-# 仅检查本机组件，确认进程丢失即恢复；失败期间仍检查是否已被系统自动拉起。
-agent_process_watch() {
-    local now=$1
-    [ "$((now-${LAST_PROCESS_TS:-0}))" -ge "$PROCESS_CHECK_INTERVAL" ] || return 0
-    LAST_PROCESS_TS=$now
-    if core_services_missing; then
-        [ "$now" -ge "$PROCESS_RECOVERY_RETRY_AFTER" ] || return 0
-        agent_check "$now"
-    else
-        PROCESS_RECOVERY_RETRY_AFTER=0
-    fi
-}
-
-# 自定义同步周期早于连接检查时，仅同步当前域名与待补发的变化。
-agent_watch() {
-    local now=$1 d
-    if ! svc_running "$SVC_ARGO" "$SVC_ARGO" || ! svc_running "$SVC_SB" "$SVC_SB"; then
-        LAST_WATCH_TS=$now
-        return 0
-    fi
-    if [ "$MODE" = quick ]; then
-        d=$(domain_from_metrics 9>&-)
-        if [ -n "$d" ]; then
-            agent_domain_save "$d" "$now" || { LAST_WATCH_TS=$now; return 1; }
-            WATCH_EMPTY_WARNED=0
-        elif [ -z "$d" ]; then
-            # 监视仅告警不恢复，避免短暂 metrics 不可用导致反复重启。
-            if [ "${WATCH_EMPTY_WARNED:-0}" != 1 ]; then agent_log WARN "本机 metrics 暂无域名，等待远端自检"; WATCH_EMPTY_WARNED=1; fi
-        fi
-    elif [ "$DOMAIN_SYNC_PENDING" = 1 ]; then
-        agent_domain_save "$DOMAIN" "$now" || { LAST_WATCH_TS=$now; return 1; }
-    fi
-    # 上报失败不会更新 LAST_REPORTED_DOMAIN，这里只补发已知变更，不是心跳。
-    if [ -n "$DOMAIN" ] && [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_pending || true; fi
-    LAST_WATCH_TS=$now
-}
-
-# 恢复后按正常周期检查；上报失败由待补发退避处理，不提前测活。
+# 所有自动恢复与补发均在同一小时轮次执行。
 agent_connection_ready() {
-    ARGO_REBUILD_PENDING=0; ARGO_FAILED_DOMAIN=""; PROCESS_RECOVERY_RETRY_AFTER=0
+    ARGO_REBUILD_PENDING=0; ARGO_FAILED_DOMAIN=""; RECOVERY_RETRY_AFTER=0
     location_refresh
     report_pending || agent_log WARN "连接已恢复，但上报失败，${RECOVERY_RETRY_INTERVAL}s 后补发"
-    LAST_CHECK_TS=$(date +%s); LAST_WATCH_TS=$LAST_CHECK_TS
+    LAST_CHECK_TS=$(date +%s)
 }
 
 # 默认每小时只检查一次；重建失败重试重建，不重复探测已失效域名。
 agent_check() {
     local now=$1 d
-    LAST_CHECK_TS=$now; LAST_WATCH_TS=$now
+    LAST_CHECK_TS=$now
     core_tmp_cleanup || true
     if core_services_missing; then
         agent_log WARN "本机核心进程或文件丢失，立即恢复服务并同步域名"
@@ -2461,10 +2408,11 @@ agent_once() {
     if [ "$rc" = 10 ]; then trap - TERM INT; return 0
     elif [ "$rc" != 0 ]; then trap - TERM INT; return "$rc"; fi
     AGENT_ACTIVE=1
+    RECOVERY_RETRY_AFTER=0
     agent_state_load
     resource_maintenance "$(date +%s)"
     if agent_startup; then
-        if [ "$(date +%s)" -ge "$PROCESS_RECOVERY_RETRY_AFTER" ]; then agent_check "$(date +%s)"; rc=$?
+        if [ "$(date +%s)" -ge "$RECOVERY_RETRY_AFTER" ]; then agent_check "$(date +%s)"; rc=$?
         else rc=1; fi
         agent_state_save
     else rc=1; fi
@@ -2477,27 +2425,21 @@ agent_once() {
 # 主循环供系统守护和容器前台共用，锁与退出处理由调用者持有。
 agent_loop_body() {
     local now
-    WATCH_EMPTY_WARNED=0
-    LAST_PROCESS_TS=0; PROCESS_RECOVERY_RETRY_AFTER=0
+    RECOVERY_RETRY_AFTER=0
     agent_state_load
     RESOURCE_LAST_MAINTENANCE_TS=0
     resource_maintenance "$(date +%s)"
     agent_startup || return 1
     # 每次启动都检查当前连接，开机网络未就绪不能沿用上次运行的检查等待。
     agent_log INFO "守护启动，立即检查当前连接并同步域名"
-    if [ "$(date +%s)" -ge "$PROCESS_RECOVERY_RETRY_AFTER" ]; then agent_check "$(date +%s)"; fi
-    agent_log INFO "CF 检查启动: 本机进程每 ${PROCESS_CHECK_INTERVAL}s，远端连接每 ${CHECK_INTERVAL}s 仅检查一次，域名同步每 ${WATCH_INTERVAL}s；进程丢失立即恢复，连接失败直接重建，重建失败 ${RECOVERY_RETRY_INTERVAL}s 后重试，不重复测活"
+    if [ "$(date +%s)" -ge "$RECOVERY_RETRY_AFTER" ]; then agent_check "$(date +%s)"; fi
+    agent_log INFO "自动检查、域名同步、进程恢复、重建与上报补发统一每 ${AUTOMATIC_INTERVAL}s 一轮；连接仅检查一次，失败直接重建，下轮重试，不重复测活"
     while [ "$STOP" != 1 ]; do
         now=$(date +%s)
         resource_maintenance "$now"
-        agent_process_watch "$now"
-        now=$(date +%s)
         if [ "$((now-LAST_CHECK_TS))" -ge "$CHECK_INTERVAL" ]; then
             agent_check "$now"
-        elif [ "$WATCH_INTERVAL" -gt 0 ] && [ "$((now-LAST_WATCH_TS))" -ge "$WATCH_INTERVAL" ]; then
-            agent_watch "$now"
         fi
-        agent_report_retry "$(date +%s)"
         agent_state_save "$now" || agent_log WARN "守护状态保存失败，将稍后重试: $AGENT_STATE"
         agent_sleep 5 || break
     done
@@ -2545,7 +2487,7 @@ run_cleanup() {
 
 # 容器 ENTRYPOINT 不注册后台 agent，获得单实例锁后一直运行至 TERM/INT。
 run_foreground() {
-    local rc pid start mode oldmp
+    local rc pid start mode oldmp argo_migrate=0
     [ "$ENV_INIT" = none ] || { echo "错误: run 用于无 init/便携环境；系统服务请使用 tunel agent start。" >&2; return 1; }
     if [ ! -s "$AGENT_ENV" ] && [ ! -s "$NODE_DIR/quick.env" ] && [ ! -s "$NODE_DIR/fixed.env" ]; then
         echo "错误: run 需要已安装配置，请先执行 quick/fixed 并持久保存工作目录。" >&2; return 1
@@ -2581,7 +2523,9 @@ run_foreground() {
     oldmp=$MP
     metrics_port_ensure || { rc=$?; run_cleanup; trap - EXIT TERM INT; return "$rc"; }
     if [ -z "$oldmp" ] || [ "$oldmp" != "$MP" ]; then svc_stop "$SVC_ARGO" "$SVC_ARGO" || true; fi
-    # 先生成安全的核心控制器再复用启动逻辑，已运行组件会保持原域名。
+    # 覆盖前识别旧 quick 启动器，取消旧进程内仍在等待的短退避。
+    if [ "$MODE" = quick ] && [ "$(env_get "$BIN_DIR/$SVC_ARGO-run" tunel_argo_retry)" != "$AUTOMATIC_INTERVAL" ]; then argo_migrate=1; fi
+    # 先生成安全的核心控制器再复用启动逻辑。
     svc_wrapper "$SVC_SB" "\"$SB_BIN\" run -c \"$SB_CFG\"" && svc_none_install "$SVC_SB" "$LOG_DIR" no-start || {
         run_cleanup; trap - EXIT TERM INT; return 1
     }
@@ -2599,6 +2543,9 @@ run_foreground() {
     if [ "$rc" != 0 ] || ! svc_none_install "$SVC_ARGO" "$LOG_DIR" no-start; then
         run_cleanup; trap - EXIT TERM INT; return 1
     fi
+    if [ "$argo_migrate" = 1 ] && ! svc_stop "$SVC_ARGO" "$SVC_ARGO"; then
+        run_cleanup; trap - EXIT TERM INT; return 1
+    fi
     agent_log INFO "前台 run 启动: $WORK_DIR"
     agent_loop_body; rc=$?
     run_cleanup
@@ -2606,7 +2553,7 @@ run_foreground() {
     return "$rc"
 }
 
-# 更新落地脚本和三个服务的自启配置，start 保留已运行核心；metrics 变化才替换隧道。
+# 更新脚本和三服务周期；旧 quick 启动器需受控重启以取消内存中的短退避。
 agent_start() {
     local oldmp argo_action=start
     dependencies_ensure || return 3
@@ -2620,6 +2567,7 @@ agent_start() {
         svc_stop "$SVC_ARGO" "$SVC_ARGO" || return 1
     fi
     sb_service_up start || sb_service_restore || return 1
+    if [ "$MODE" = quick ] && [ "$(env_get "$BIN_DIR/$SVC_ARGO-run" tunel_argo_retry)" != "$AUTOMATIC_INTERVAL" ]; then argo_action=restart; fi
     svc_running "$SVC_ARGO" "$SVC_ARGO" || argo_action=restart
     argo_service_configure "$argo_action" || argo_service_restore || return 1
     if [ "$ENV_INIT" = none ]; then
@@ -2635,7 +2583,7 @@ agent_status() {
     if [ -f "$AGENT_ENV" ]; then
         display_domain=$(env_get "$AGENT_ENV" DOMAIN); status_mode=$(env_get "$AGENT_ENV" MODE)
         if [ "$status_mode" = quick ] && ! quick_domain_valid "$display_domain"; then display_domain="未取得有效临时隧道域名"; fi
-        printf '域名: %s\n本机进程检查: 每 %ss，进程丢失立即恢复\nCF 连接检查: 每 %ss 仅一次，域名同步每 %ss；失败直接重建，重建失败 %ss 后重试，不重复测活\n上次成功上报: %s\n' "$display_domain" "$PROCESS_CHECK_INTERVAL" "$(env_get "$AGENT_ENV" CHECK_INTERVAL)" "$(env_get "$AGENT_ENV" WATCH_INTERVAL)" "$RECOVERY_RETRY_INTERVAL" "$(env_get "$AGENT_ENV" LAST_REPORT_TS)"
+        printf '域名: %s\n自动检查、域名同步、进程恢复、重建与补发: 统一每 %ss（1 小时）一轮\n每轮只检查一次，失败直接重建，下轮重试\n上次成功上报: %s\n' "$display_domain" "$AUTOMATIC_INTERVAL" "$(env_get "$AGENT_ENV" LAST_REPORT_TS)"
     fi
     if [ "$TUNEL_SYSTEM" != 1 ]; then
         printf '便携目录: %s\n' "$TUNEL_HOME"
