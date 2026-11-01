@@ -411,9 +411,9 @@ async function reportNode(request, config, now, cache, origin) {
     location = requestLocation(request, payload);
   }
   const baseName = payload.name;
-  const name = locationName(location);
-  const next = { ...payload, ...location, locationVerified, baseName, name, link: renameVmessLink(payload.link, name) };
-  if (old && ['host', 'path', 'uuid', 'link', 'addr', 'name', 'baseName', 'mode', 'port', 'country', 'region', 'countryName', 'regionName', 'locationVerified'].every(field => old[field] === next[field])) {
+  const displayName = locationName(location);
+  const next = { ...payload, ...location, locationVerified, baseName, name: baseName, displayName, link: renameVmessLink(payload.link, displayName) };
+  if (old && ['host', 'path', 'uuid', 'link', 'addr', 'name', 'baseName', 'displayName', 'mode', 'port', 'country', 'region', 'countryName', 'regionName', 'locationVerified'].every(field => old[field] === next[field])) {
     return json({ ok: true, id: payload.id, skipped: true });
   }
   await config.kv.put(key, JSON.stringify({ ...next, firstSeen: old?.firstSeen ?? now, lastReport: now }));
@@ -454,8 +454,9 @@ async function readNodes(kv) {
   await Promise.all(Array.from({ length: Math.min(6, keys.length) }, () => readNext()));
   return nodes.filter(node => node && typeof node === 'object').map(node => {
     const record = { country: '', region: '', countryName: '', regionName: '', baseName: node.name ?? '', ...node };
-    const name = locationName(record);
-    return { ...record, name, link: renameVmessLink(record.link, name) };
+    const name = typeof record.baseName === 'string' ? record.baseName || record.id : record.name || record.id;
+    const displayName = locationName(record);
+    return { ...record, name, displayName, link: renameVmessLink(record.link, displayName) };
   });
 }
 
@@ -854,7 +855,7 @@ function renderNodes(data) {
   const table = document.createElement('table');
   const head = document.createElement('thead');
   const header = document.createElement('tr');
-  for (const label of ['名称', '国家/地区', '模式', '主机', '连接地址', '最后上报', '操作']) {
+  for (const label of ['机器名称', '国家/地区', '模式', '主机', '连接地址', '最后上报', '操作']) {
     const th = document.createElement('th'); th.textContent = label; header.appendChild(th);
   }
   head.appendChild(header); table.appendChild(head);

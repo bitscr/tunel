@@ -76,7 +76,9 @@ curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh \
     --report-token 'REPLACE_REPORT_TOKEN' -y
 ```
 
-固定模式也可使用 `--json-file /path/to/tunnel.json`，与 `--token` 二选一。上报 URL 与 token 必须同时提供或同时省略；独立安装省略这两个参数即可。安装结束会显示节点链接和服务状态，可直接导入客户端。
+固定模式也可使用 `--json-file /path/to/tunnel.json`，与 `--token` 二选一。上报 URL 与 token 必须同时提供或同时省略；独立安装省略这两个参数即可。取得有效域名后会显示节点链接和服务状态，可直接导入客户端。
+
+首次取域名失败会显示错误、服务状态和有限日志，退出码为 5；脚本与配置已保存，默认启动守护继续恢复，取得有效域名后更新节点并上报。Cloudflare 申请临时隧道返回 HTTP 429 时，至少等待 5 分钟再申请。使用 `--no-agent` 时需手动启动 `agent start` 或容器入口 `run`；恢复后执行 `node` 查看节点。
 
 ### 系统安装与普通用户
 
@@ -118,12 +120,12 @@ stop_grace_period: 45s
 | 参数 | 说明 |
 | --- | --- |
 | `--port N` | 本地监听端口，默认随机；显式端口须为 1–65535 且未占用 |
-| `--name X` | 记录标识字段，不改变国家地区显示名称 |
+| `--name X` | 管理页的机器名称，默认主机名；订阅名称仍使用国家地区 |
 | `--node-id ID` | 自定义 4–64 位字母、数字、下划线或短横线；克隆机器需独立 ID |
 | `--cfip H` | 单一连接 IP / 域名；批量地址使用面板 CFIP |
-| `--check-interval S` | 连接检查周期，默认 300（5 分钟），范围 300–86400 秒 |
+| `--check-interval S` | 连接检查周期，默认 3600（1 小时），范围 300–86400 秒 |
 | `--watch-interval S` | 域名同步周期，默认 60（1 分钟）；0 关闭额外同步，或 15–86400 秒 |
-| `--no-agent` | 不启动后台守护；配置了上报时仍首次上报，容器可随后启动 run |
+| `--no-agent` | 不启动后台守护；取得有效节点且配置了上报时仍首次上报，容器可随后启动 run |
 | `-y` / `--yes` | 非交互安装 |
 
 也可使用 `TUNEL_HOME`、`TUNEL_NODE_NAME`、`TUNEL_NODE_ID`、`TUNEL_CFIP`、`TUNEL_REPORT_URL`、`TUNEL_REPORT_TOKEN` 环境变量。
@@ -139,7 +141,7 @@ stop_grace_period: 45s
 | `tunel config K=V ...` | 修改配置 |
 | `tunel version` / `tunel help` | 版本 / 完整用法 |
 
-config 支持 REPORT_URL、REPORT_TOKEN、NODE_NAME、CFIP、CHECK_INTERVAL、WATCH_INTERVAL。重新 quick / fixed 安装时，未显式指定的周期恢复默认值：连接检查 300 秒、域名同步 60 秒。
+config 支持 REPORT_URL、REPORT_TOKEN、NODE_NAME、CFIP、CHECK_INTERVAL、WATCH_INTERVAL。重新 quick / fixed 安装时，未显式指定的周期恢复默认值：连接检查 3600 秒、域名同步 60 秒。
 
 ### 更新已有安装
 
@@ -147,27 +149,27 @@ config 支持 REPORT_URL、REPORT_TOKEN、NODE_NAME、CFIP、CHECK_INTERVAL、WA
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh | bash -s -- agent start
-tunel config CHECK_INTERVAL=300 WATCH_INTERVAL=60
+tunel config CHECK_INTERVAL=3600 WATCH_INTERVAL=60
 ```
 
 用户或便携安装须沿用原 TUNEL_HOME；默认用户目录例如：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh | TUNEL_HOME="$HOME/.local/share/tunel" bash -s -- agent start
-"$HOME/.local/share/tunel/bin/tunel" config CHECK_INTERVAL=300 WATCH_INTERVAL=60
+"$HOME/.local/share/tunel/bin/tunel" config CHECK_INTERVAL=3600 WATCH_INTERVAL=60
 ```
 
 自动兜底或自定义目录将两处示例路径都换成原目录。脚本更新会刷新本地脚本和相应的服务自启配置，保留既有 UUID、端口、路径、上报配置及已有周期；第二步 config 才应用新周期，无需重新填写上报 token。更新后的守护立即恢复缺失组件、同步当前域名，并检查连接。
 
 ## 日常使用
 
-在 `/ui` 的「记录」查看节点，「数据源」保存手工链接或远程订阅，「访问链接」复制通用、Clash、sing-box、Surge、Quantumult X 或 Loon 订阅。订阅支持 GET / HEAD；保存后刷新订阅，跨区传播仍可能短暂延迟。
+在 `/ui` 的「记录」按机器名称区分服务器，默认使用主机名；订阅里的节点名称仍只使用国家地区。「数据源」保存手工链接或远程订阅，「访问链接」复制通用、Clash、sing-box、Surge、Quantumult X 或 Loon 订阅。订阅支持 GET / HEAD；保存后刷新订阅，跨区传播仍可能短暂延迟。
 
 设置页 CFIP 支持换行或逗号分隔的 IP / 域名及可选端口，默认端口 443；指定 IPv6 端口时使用 `[IPv6]:端口`。保存空 CFIP 会关闭自定义连接地址，不再回退环境变量；CFIP 不改变国家地区名称。
 
 本机巡检默认间隔 30 秒，检查 cloudflared、sing-box 进程与核心文件、sing-box 配置；正在进行的连接检查、上报或下载结束后继续巡检。发现进程或文件丢失时立即恢复服务，取得当前有效临时域名后上报，无需重启机器。已有核心可运行就继续使用，缺失或无法运行时重新下载并校验；恢复保留原 UUID、端口和路径。恢复失败后约 5 分钟重试。
 
-每次守护启动立即检查连接；默认每 5 分钟进行一轮外网检查，每轮最多探测 3 次，失败之间间隔 10 秒，连续 3 次失败才重建隧道。域名默认每 1 分钟同步，cloudflared 被系统自动拉起后也会同步新域名。重建或上报失败后约 5 分钟重试，取得新域名后刷新客户端订阅。
+每次守护启动立即检查一次连接，此后默认每 1 小时检查一次；失败直接重建，不连续重复测活。重建失败约 5 分钟后直接重试重建，不再探测已判定失效的旧域名；上报失败只补发，不因此提前检查连接。域名默认每 1 分钟从本机同步，cloudflared 被系统自动拉起后也会同步新域名；本机域名同步不做外网测活。取得新域名后刷新客户端订阅。
 
 systemd 安装会自动拉起被杀的守护；普通用户与容器安装需由进程管理器或容器重启策略保持守护运行。
 
@@ -184,6 +186,6 @@ Worker 不判断服务器是否在线，也不会自动删除离线记录。Quic
 
 自定义目录使用其 `bin/tunel uninstall -y`。注销失败不会阻止本地清理，此时到记录页手动删除；永久下线的服务器也需手动移除。
 
-安装失败先阅读终端显示的原因和日志路径；缺依赖先预装，目录错误改为可写的专用目录。上报 401 时核对 REPORT_TOKEN；管理功能报配置错误时核对 KV、两个 secrets 与部署环境。
+安装失败先阅读终端显示的原因和日志路径；缺依赖先预装，目录错误改为可写的专用目录。申请临时域名出现 HTTP 429 表示限流，保持守护运行并等待自动重试；5 分钟是本地重试间隔，Cloudflare 何时解除限流由其服务决定。上报 401 时核对 REPORT_TOKEN；管理功能报配置错误时核对 KV、两个 secrets 与部署环境。
 
 订阅地址与安装命令含凭据，请妥善保管。第三方 SUBAPI 可读取节点明文，需要时改用可信或自建转换服务。核心版本及上游来源见 [vendor/README.md](vendor/README.md)。
