@@ -3,6 +3,6 @@
 74f690f6707182839b63e0465726c7776dd63f0a174390b911d5d71f35cab94e  vendor/cloudflared/cloudflared-linux-arm
 3df43aedc9ff291d1735b5cb576cb97e0b157488796db2e32b28aecabb445775  vendor/cloudflared/cloudflared-linux-arm64
 efb46daaa48ee55e090bd1dfcaee34bfbe9bdbd9b89fa9f328d25f81a619e865  vendor/sing-box/sing-box-1.14.4-linux-386.tar.gz
-699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968  vendor/sing-box/sing-box-1.14.4-linux-amd64.tar.gz
-436441f76ee2f7fe21b5b2d426d3cb261a480455a704865789ad533e4273ec26  vendor/sing-box/sing-box-1.14.4-linux-arm64.tar.gz
+8f7c5f0651238850d96a0e488e5473cd77ec1a0098f63942e943f475a12057ca  vendor/sing-box/sing-box-1.14.4-linux-amd64.tar.gz
+b95e25f921dc5e17a4cf13327243d1177642c7e35425bf5372862c477c359f56  vendor/sing-box/sing-box-1.14.4-linux-arm64.tar.gz
 fd164ed45ebc784f657a3e1d0e0ad0f68afdcff864ee57122c2cfed3ddb80a00  vendor/sing-box/sing-box-1.14.4-linux-armv7.tar.gz

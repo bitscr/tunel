@@ -300,6 +300,65 @@ function validateId(id) {
   return id;
 }
 
+const COUNTRY_CODES = new Set('AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS XK YE YT ZA ZM ZW'.split(' '));
+
+function normalizeCountry(value) {
+  const country = typeof value === 'string' ? value.trim().toUpperCase() : '';
+  return COUNTRY_CODES.has(country) ? country : '';
+}
+
+function normalizeRegion(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,16}$/.test(value) ? value.toUpperCase() : '';
+}
+
+function countryLabel(country) {
+  if (!country) {
+    return '';
+  }
+  try {
+    return new Intl.DisplayNames(['zh-CN'], { type: 'region', fallback: 'none' }).of(country) || country;
+  } catch {
+    return country;
+  }
+}
+
+function requestLocation(request, reported = {}) {
+  const cf = request.cf && typeof request.cf === 'object' ? request.cf : null;
+  const cfCountry = normalizeCountry(cf?.country);
+  const reportedCountry = normalizeCountry(reported.country);
+  const country = reportedCountry || cfCountry;
+  const reportedRegion = reportedCountry ? normalizeRegion(reported.region) : '';
+  const reportedRegionName = reportedCountry && typeof reported.regionName === 'string' ? reported.regionName.trim() : '';
+  const cfRegion = country && cfCountry === country ? normalizeRegion(cf?.regionCode) : '';
+  const cfRegionName = country && cfCountry === country && typeof cf?.region === 'string' ? Array.from(cf.region.trim().replace(/[\u0000-\u001f\u007f-\u009f]/g, '')).slice(0, 128).join('') : '';
+  const region = reportedRegion || (reportedRegionName ? '' : cfRegion);
+  const regionName = reportedRegionName || (!reportedRegion || reportedRegion === cfRegion ? cfRegionName : '');
+  return { country, region, countryName: countryLabel(country), regionName };
+}
+
+function verifiedLocation(value) {
+  const country = normalizeCountry(value.country);
+  const region = country ? normalizeRegion(value.region) : '';
+  const regionName = country && typeof value.regionName === 'string' && Array.from(value.regionName).length <= 128 && !/[\u0000-\u001f\u007f-\u009f]/.test(value.regionName) ? value.regionName.trim() : '';
+  return { country, region, countryName: countryLabel(country), regionName };
+}
+
+function locationName(location) {
+  return [location.countryName || countryLabel(normalizeCountry(location.country)), location.regionName || location.region].filter(Boolean).join(' · ') || '未识别地区';
+}
+
+function renameVmessLink(link, name) {
+  try {
+    const node = JSON.parse(decodeBase64(link.slice('vmess://'.length)));
+    if (!node || typeof node !== 'object' || Array.isArray(node)) {
+      throw new Error('invalid vmess object');
+    }
+    return `vmess://${encodeBase64(JSON.stringify({ ...node, ps: name }))}`;
+  } catch {
+    return link;
+  }
+}
+
 function validateReport(payload) {
   validateId(payload.id);
   const checks = [
@@ -309,11 +368,18 @@ function validateReport(payload) {
     ['path', typeof payload.path === 'string' && payload.path.startsWith('/') && payload.path.length <= 128],
     ['uuid', typeof payload.uuid === 'string' && /^[0-9a-fA-F-]{36}$/.test(payload.uuid)],
     ['link', typeof payload.link === 'string' && payload.link.startsWith('vmess://') && payload.link.length <= 2048],
+    ['country', payload.country === undefined || payload.country === '' || typeof payload.country === 'string' && /^[A-Za-z]{2}$/.test(payload.country)],
+    ['region', payload.region === undefined || payload.region === '' || typeof payload.region === 'string' && /^[A-Za-z0-9_-]{1,16}$/.test(payload.region)],
+    ['regionName', payload.regionName === undefined || typeof payload.regionName === 'string' && Array.from(payload.regionName).length <= 128 && !/[\u0000-\u001f\u007f-\u009f]/.test(payload.regionName)],
+    ['locationVerified', payload.locationVerified === undefined || typeof payload.locationVerified === 'boolean'],
   ];
   for (const [field, valid] of checks) {
     if (!valid) {
       throw new HttpError(400, `${field} 无效`);
     }
+  }
+  if (payload.locationVerified === true && !normalizeCountry(payload.country)) {
+    throw new HttpError(400, 'country 无效');
   }
   const port = payload.port === undefined ? 443 : payload.port;
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -330,10 +396,23 @@ async function reportNode(request, config, now) {
   const payload = validateReport(await readJson(request, 8192));
   const key = `node:${payload.id}`;
   const old = await config.kv.get(key, 'json');
-  if (old && ['host', 'path', 'uuid', 'link', 'addr', 'name'].every(field => old[field] === payload[field])) {
+  let location;
+  let locationVerified = payload.locationVerified;
+  if (locationVerified === true) {
+    location = verifiedLocation(payload);
+  } else if (locationVerified === false) {
+    locationVerified = old?.locationVerified === true;
+    location = verifiedLocation(locationVerified ? old : {});
+  } else {
+    location = requestLocation(request, payload);
+  }
+  const baseName = payload.name;
+  const name = locationName(location);
+  const next = { ...payload, ...location, locationVerified, baseName, name, link: renameVmessLink(payload.link, name) };
+  if (old && ['host', 'path', 'uuid', 'link', 'addr', 'name', 'baseName', 'mode', 'port', 'country', 'region', 'countryName', 'regionName', 'locationVerified'].every(field => old[field] === next[field])) {
     return json({ ok: true, id: payload.id, skipped: true });
   }
-  await config.kv.put(key, JSON.stringify({ ...payload, firstSeen: old?.firstSeen ?? now, lastReport: now }));
+  await config.kv.put(key, JSON.stringify({ ...next, firstSeen: old?.firstSeen ?? now, lastReport: now }));
   return json({ ok: true, id: payload.id });
 }
 
@@ -368,7 +447,11 @@ async function readNodes(kv) {
     }
   }
   await Promise.all(Array.from({ length: Math.min(6, keys.length) }, () => readNext()));
-  return nodes.filter(node => node && typeof node === 'object');
+  return nodes.filter(node => node && typeof node === 'object').map(node => {
+    const record = { country: '', region: '', countryName: '', regionName: '', baseName: node.name ?? '', ...node };
+    const name = locationName(record);
+    return { ...record, name, link: renameVmessLink(record.link, name) };
+  });
 }
 
 async function readSources(config) {
@@ -511,7 +594,7 @@ function expandLinks(links, cfip) {
         throw new Error('invalid vmess object');
       }
       for (const address of cfip) {
-        expanded.push(`vmess://${encodeBase64(JSON.stringify({ ...node, add: address.host, port: address.port, ps: `${node.ps ?? ''} | ${address.host}` }))}`);
+        expanded.push(`vmess://${encodeBase64(JSON.stringify({ ...node, add: address.host, port: address.port }))}`);
       }
     } catch {
       expanded.push(link);
@@ -587,7 +670,7 @@ function conversionUrl(config, format, sources) {
   const params = new URLSearchParams({
     target: format === 'base64' ? 'mixed' : format,
     url: sources.join('|'),
-    insert: 'false', config: config.subconfig, emoji: 'true', list: 'false', tfo: 'false',
+    insert: 'false', config: config.subconfig, emoji: 'false', append_type: 'false', list: 'false', tfo: 'false',
     scv: 'true', fdn: 'false', sort: 'false', new_name: 'true',
   });
   if (format === 'surge') {
@@ -753,14 +836,16 @@ function renderNodes(data) {
   const table = document.createElement('table');
   const head = document.createElement('thead');
   const header = document.createElement('tr');
-  for (const label of ['名称', '模式', '主机', '连接地址', '更新时间', '操作']) {
+  for (const label of ['名称', '国家/地区', '模式', '主机', '连接地址', '更新时间', '操作']) {
     const th = document.createElement('th'); th.textContent = label; header.appendChild(th);
   }
   head.appendChild(header); table.appendChild(head);
   const body = document.createElement('tbody');
   for (const node of data.nodes) {
     const row = document.createElement('tr');
-    cell(row, node.name || node.id); cell(row, node.mode === 'quick' ? '临时' : '固定');
+    cell(row, node.name || node.id);
+    cell(row, [node.countryName || node.country, node.regionName || node.region].filter(Boolean).join(' · ') || '未识别');
+    cell(row, node.mode === 'quick' ? '临时' : '固定');
     cell(row, node.host); cell(row, node.addr || node.host);
     const time = cell(row, relativeTime(node.lastReport, data.now));
     time.title = new Date(Number(node.lastReport) * 1000).toLocaleString();
@@ -937,6 +1022,17 @@ async function handleRequest(request, env) {
       response.headers.set('Set-Cookie', await issueUiSession(config, url.origin, now));
     }
     return response;
+  }
+  if (path === '/api/location') {
+    requireMethod(request, ['GET']);
+    if (!route.reportAuthorized) {
+      throw new HttpError(401, '位置鉴权失败');
+    }
+    const organizationValue = request.cf?.asOrganization;
+    const organization = typeof organizationValue === 'string' && Array.from(organizationValue).length <= 128 && !/[\u0000-\u001f\u007f-\u009f]/.test(organizationValue) ? organizationValue.trim() : '';
+    const asnValue = request.cf?.asn;
+    const asn = Number.isInteger(asnValue) && asnValue > 0 && asnValue <= 4294967295 ? asnValue : 0;
+    return json({ ...requestLocation(request), ip: request.headers.get('CF-Connecting-IP') ?? '', organization, asn });
   }
   if (path === '/api/report' || path === '/api/node/delete') {
     requireMethod(request, ['POST']);

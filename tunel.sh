@@ -43,6 +43,7 @@ esac
 # ============================================================================
 TUNEL_VERSION="2.0.0"
 DEFAULT_CHECK_INTERVAL=7200
+LOCATION_MEMORY_ATTEMPT_TS=0
 VENDOR_CF_TAG="2026.10.7"
 VENDOR_SB_TAG="1.14.4"
 VENDOR_REPO="${VENDOR_REPO:-bitscr/tunel}"
@@ -56,8 +57,8 @@ BUILTIN_SUMS="
 74f690f6707182839b63e0465726c7776dd63f0a174390b911d5d71f35cab94e  vendor/cloudflared/cloudflared-linux-arm
 3df43aedc9ff291d1735b5cb576cb97e0b157488796db2e32b28aecabb445775  vendor/cloudflared/cloudflared-linux-arm64
 efb46daaa48ee55e090bd1dfcaee34bfbe9bdbd9b89fa9f328d25f81a619e865  vendor/sing-box/sing-box-1.14.4-linux-386.tar.gz
-699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968  vendor/sing-box/sing-box-1.14.4-linux-amd64.tar.gz
-436441f76ee2f7fe21b5b2d426d3cb261a480455a704865789ad533e4273ec26  vendor/sing-box/sing-box-1.14.4-linux-arm64.tar.gz
+8f7c5f0651238850d96a0e488e5473cd77ec1a0098f63942e943f475a12057ca  vendor/sing-box/sing-box-1.14.4-linux-amd64.tar.gz
+b95e25f921dc5e17a4cf13327243d1177642c7e35425bf5372862c477c359f56  vendor/sing-box/sing-box-1.14.4-linux-arm64.tar.gz
 fd164ed45ebc784f657a3e1d0e0ad0f68afdcff864ee57122c2cfed3ddb80a00  vendor/sing-box/sing-box-1.14.4-linux-armv7.tar.gz
 "
 
@@ -212,13 +213,16 @@ runtime_dirs_ensure() {
     else
         # 便携模式只在指定树内建目录，不安装系统服务或开机钩子。
         portable_paths_valid || return 2
-        mkdir -p -m 700 "$TUNEL_HOME" "$BIN_DIR" "$RUN_DIR" "$TMP_DIR" || { echo "错误: 无法写入 TUNEL_HOME=$TUNEL_HOME" >&2; return 1; }
+        mkdir -p -m 700 "$TUNEL_HOME" "$BIN_DIR" "$RUN_DIR" || { echo "错误: 无法写入 TUNEL_HOME=$TUNEL_HOME" >&2; return 1; }
         chmod 700 "$TUNEL_HOME" "$BIN_DIR" "$RUN_DIR" || return 1
-        chmod 700 "$TMP_DIR" || return 1
-        export TMPDIR="$TMP_DIR"
     fi
-    mkdir -p -m 700 "$WORK_DIR" "$SB_DIR" "$NODE_DIR" "$LOG_DIR" || { echo "错误: 无法写入工作/日志目录 $WORK_DIR / $LOG_DIR" >&2; return 1; }
-    chmod 700 "$WORK_DIR" "$SB_DIR" "$NODE_DIR" "$LOG_DIR"
+    if [ -L "$TMP_DIR" ] || { [ -e "$TMP_DIR" ] && [ ! -d "$TMP_DIR" ]; }; then
+        echo "错误: 安装临时目录必须是私有普通目录: $TMP_DIR" >&2; return 1
+    fi
+    mkdir -p -m 700 "$WORK_DIR" "$SB_DIR" "$NODE_DIR" "$LOG_DIR" "$TMP_DIR" || { echo "错误: 无法写入工作/日志/临时目录 $WORK_DIR / $LOG_DIR / $TMP_DIR" >&2; return 1; }
+    chmod 700 "$WORK_DIR" "$SB_DIR" "$NODE_DIR" "$LOG_DIR" "$TMP_DIR" || return 1
+    # 系统和便携安装均优先使用自己的临时目录，不占共享 /tmp。
+    export TMPDIR="$TMP_DIR"
 }
 
 # 专用子目录不能通过符号链接越过便携树，尤其不能 chmod 或卸载外部目录。
@@ -426,12 +430,13 @@ rand_token() {
 # 使用有限超时下载，并让 HTTP 错误传播给强校验安装步骤。
 http_fetch() { # $1=url $2=输出文件
     [ "${STOP:-0}" != 1 ] || return 1
+    local __tunel_fetch_limit=${3:-134217728}
     if has curl; then
         # curl 能显式拒绝 HTTP 4xx/5xx，并控制连接与整次下载时间。
         if [ "${RUN_ACTIVE:-0}" = 1 ]; then
-            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 -o "$2" "$1" 7>&- 9>&- &
+            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 --max-filesize "$__tunel_fetch_limit" -o "$2" "$1" 7>&- 9>&- &
         else
-            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 -o "$2" "$1" 9>&-
+            curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 --max-filesize "$__tunel_fetch_limit" -o "$2" "$1" 9>&-
             return $?
         fi
     elif has wget; then
@@ -471,7 +476,7 @@ vendor_sums_load() {
     # 2) 否则从仓库拉
     if [ -z "$VENDOR_SUMS" ]; then
         f=$(mktemp) || return 1
-        if http_fetch "$VENDOR_RAW_BASE/vendor/SHA256SUMS" "$f"; then
+        if http_fetch "$VENDOR_RAW_BASE/vendor/SHA256SUMS" "$f" 16384; then
             VENDOR_SUMS=$(cat "$f")
         fi
         rm -f "$f"
@@ -561,6 +566,27 @@ sb_arch() { # sing-box 资产名后缀
 # ============================================================================
 # 内核安装（都是从 vendor 走 sha256）
 # ============================================================================
+# 只清理本安装生成、超过一天的核心暂存目录；活跃下载最多十分钟一轮。
+core_tmp_cleanup() {
+    [ -d "$TMP_DIR" ] && [ ! -L "$TMP_DIR" ] || return 0
+    find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d -name 'core-download.??????' -mtime +0 -exec rm -rf {} \; 2>/dev/null
+}
+
+# 固化核心下载和解压需要空间，安装前检查可用容量，避免写满已有系统。
+core_disk_preflight() {
+    local available
+    core_tmp_cleanup || true
+    available=$(df -Pk "$TMP_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [[ ! "$available" =~ ^[0-9]+$ ]]; then
+        echo "错误: 无法读取安装临时目录的剩余空间: $TMP_DIR" >&2; return 3
+    fi
+    if [ "$available" -lt 131072 ]; then
+        echo "错误: 核心安装至少需要 128MiB 可用磁盘空间，$TMP_DIR 当前剩余 $((available/1024))MiB；请释放空间后重试。" >&2
+        return 3
+    fi
+    return 0
+}
+
 # 版本命令必须成功且返回内容，不能把空版本或不可运行的文件当作已安装。
 core_version_read() {
     local bin=$1 argument=$2 output rc
@@ -570,6 +596,10 @@ core_version_read() {
         CORE_VERSION_ERROR="版本命令退出码 $rc；架构 $(uname -m)"
         [ -z "$output" ] || CORE_VERSION_ERROR+=$'\n'"$output"
         [ -n "$output" ] || CORE_VERSION_ERROR+=$'\n'"未返回版本信息。"
+        if [ "$rc" = 127 ] && [ -f "$bin" ] && [[ "$output" == *"required file not found"* ]]; then
+            # ELF 文件存在却返回 ENOENT，通常是内核找不到该构建依赖的动态加载器。
+            CORE_VERSION_ERROR+=$'\n'"文件存在但系统无法加载，通常缺少二进制所需的动态加载器；请使用本项目 vendor 的静态兼容构建。"
+        fi
         return 1
     fi
     CORE_VERSION_TEXT=$(printf '%s\n' "$output" | head -1)
@@ -588,7 +618,8 @@ install_cloudflared() {
     fi
     local arch tmp
     arch=$(cf_arch) || { echo -e "${red}错误: 当前架构 $(uname -m) 没有 cloudflared 构建${re}"; return 1; }
-    tmp=$(mktemp -d) || return 1
+    core_disk_preflight || return 3
+    tmp=$(mktemp -d "$TMP_DIR/core-download.XXXXXX") || return 1
     echo -e "${yellow}正在安装 cloudflared ${VENDOR_CF_TAG} (linux-$arch)，来自本项目 vendor${re}"
     if ! vendor_fetch "cloudflared/cloudflared-linux-$arch" "$tmp/cloudflared"; then
         rm -rf "$tmp"; return 1
@@ -601,7 +632,8 @@ install_cloudflared() {
     if svc_running "$SVC_ARGO" "$SVC_ARGO"; then
         svc_stop "$SVC_ARGO" "$SVC_ARGO" || { echo "错误: 替换 cloudflared 前无法停止 $SVC_ARGO 服务。" >&2; rm -rf "$tmp"; return 1; }
     fi
-    mkdir -p -m 700 "$WORK_DIR" && install_bin "$tmp/cloudflared" "$CF_BIN" || {
+    # 临时目录位于同一安装树，rename 替换避免再复制一份大二进制占用磁盘。
+    mkdir -p -m 700 "$WORK_DIR" && mv -f "$tmp/cloudflared" "$CF_BIN" || {
         echo "错误: 无法将 cloudflared 安装到 $CF_BIN" >&2; rm -rf "$tmp"; return 1
     }
     rm -rf "$tmp"
@@ -622,9 +654,10 @@ install_singbox_core() {
     fi
     local arch asset tmp
     arch=$(sb_arch) || { echo -e "${red}错误: 当前架构 $(uname -m) 没有 sing-box 构建${re}"; return 1; }
+    core_disk_preflight || return 3
     asset="sing-box-${VENDOR_SB_TAG}-linux-${arch}.tar.gz"
-    tmp=$(mktemp -d) || return 1
-    echo -e "${yellow}正在安装 sing-box ${VENDOR_SB_TAG} (linux-$arch)，来自本项目 vendor${re}"
+    tmp=$(mktemp -d "$TMP_DIR/core-download.XXXXXX") || return 1
+    echo -e "${yellow}正在安装 sing-box ${VENDOR_SB_TAG} (linux-$arch)，使用本项目 vendor 静态兼容构建${re}"
     if ! vendor_fetch "sing-box/$asset" "$tmp/$asset"; then
         rm -rf "$tmp"; return 1
     fi
@@ -632,6 +665,7 @@ install_singbox_core() {
         echo -e "${red}错误: 解压 sing-box 失败${re}"
         rm -rf "$tmp"; return 1
     fi
+    rm -f "$tmp/$asset"
     local bin
     bin=$(find "$tmp" -type f -name sing-box | head -1)
     if [ -z "$bin" ]; then
@@ -646,7 +680,7 @@ install_singbox_core() {
     if svc_running "$SVC_SB" "$SVC_SB"; then
         svc_stop "$SVC_SB" "$SVC_SB" || { echo "错误: 替换 sing-box 前无法停止 $SVC_SB 服务。" >&2; rm -rf "$tmp"; return 1; }
     fi
-    mkdir -p -m 700 "$SB_DIR" && install_bin "$bin" "$SB_BIN" || {
+    mkdir -p -m 700 "$SB_DIR" && mv -f "$bin" "$SB_BIN" || {
         echo "错误: 无法将 sing-box 安装到 $SB_BIN" >&2; rm -rf "$tmp"; return 1
     }
     rm -rf "$tmp"
@@ -658,11 +692,12 @@ install_singbox_core() {
 # sing-box 配置：vmess + ws 明文（TLS 由 CF 边缘负责）
 # ============================================================================
 sb_write_config() { # $1=监听端口 $2=uuid $3=ws路径
-    local port=$1 uuid=$2 path=$3 details rc
+    local port=$1 uuid=$2 path=$3 details rc log_disabled=false
+    [ "${CORE_LOGS:-1}" = 1 ] || log_disabled=true
     mkdir -p -m 700 "$SB_DIR" && chmod 700 "$SB_DIR" || { echo "错误: 无法准备 sing-box 配置目录 $SB_DIR" >&2; return 1; }
     cat > "$SB_CFG" <<EOF
 {
-  "log": { "level": "warn", "timestamp": true },
+  "log": { "disabled": $log_disabled, "level": "warn", "timestamp": true },
   "inbounds": [
     {
       "type": "vmess",
@@ -719,10 +754,12 @@ env_set() {
         sed "s|^$key=.*|$key=$escaped|" "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
     else
         # 新键追加到副本，避免第一次安装依赖已有文件。
-        [ ! -f "$file" ] || cat "$file" > "$tmp"
-        printf '%s=%s\n' "$key" "$value" >> "$tmp"
+        [ ! -f "$file" ] || cat "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+        printf '%s=%s\n' "$key" "$value" >> "$tmp" || { rm -f "$tmp"; return 1; }
     fi
-    chmod 600 "$tmp" && mv -f "$tmp" "$file"
+    if chmod 600 "$tmp" && mv -f "$tmp" "$file"; then return 0; fi
+    rm -f "$tmp"
+    return 1
 }
 
 # 既有安装也沿用节点身份，机器标识只用于第一次生成稳定 id。
@@ -767,6 +804,31 @@ agent_load() {
     REPORT_TOKEN=$(env_get "$AGENT_ENV" REPORT_TOKEN)
     CHECK_INTERVAL=$(env_get "$AGENT_ENV" CHECK_INTERVAL); CHECK_INTERVAL=${CHECK_INTERVAL:-$DEFAULT_CHECK_INTERVAL}
     WATCH_INTERVAL=$(env_get "$AGENT_ENV" WATCH_INTERVAL); WATCH_INTERVAL=${WATCH_INTERVAL:-$DEFAULT_CHECK_INTERVAL}
+    CORE_LOGS=$(env_get "$AGENT_ENV" CORE_LOGS); CORE_LOGS=${CORE_LOGS:-1}
+    COUNTRY=$(env_get "$AGENT_ENV" COUNTRY); location_country_valid "$COUNTRY" || COUNTRY=""
+    REGION=$(env_get "$AGENT_ENV" REGION); [[ "$REGION" =~ ^[A-Za-z0-9_-]{1,16}$ ]] || REGION=""
+    REGION_NAME=$(env_get "$AGENT_ENV" REGION_NAME)
+    location_region_name_valid "$REGION_NAME" || REGION_NAME=""
+    [ -n "$COUNTRY" ] || { REGION=""; REGION_NAME=""; }
+    LOCATION_TS=$(env_get "$AGENT_ENV" LOCATION_TS); [[ "$LOCATION_TS" =~ ^[0-9]{1,12}$ ]] || LOCATION_TS=0
+    LOCATION_ATTEMPT_TS=$(env_get "$AGENT_ENV" LOCATION_ATTEMPT_TS); [[ "$LOCATION_ATTEMPT_TS" =~ ^[0-9]{1,12}$ ]] || LOCATION_ATTEMPT_TS=0
+    LOCATION_SOURCE=$(env_get "$AGENT_ENV" LOCATION_SOURCE)
+    case "$LOCATION_SOURCE" in ipinfo|ip.sb|ip-api|worker) : ;; *) LOCATION_SOURCE="" ;; esac
+    LOCATION_POLICY=$(env_get "$AGENT_ENV" LOCATION_POLICY)
+    LOCATION_IP=$(env_get "$AGENT_ENV" LOCATION_IP)
+    LOCATION_INTERFACE=$(env_get "$AGENT_ENV" LOCATION_INTERFACE)
+    LOCATION_METHOD=$(env_get "$AGENT_ENV" LOCATION_METHOD)
+    LOCATION_VERIFIED=0; LOCATION_NEEDS_REPORT=0
+    if [ "$LOCATION_POLICY" != native-v1 ]; then
+        COUNTRY=""; REGION=""; REGION_NAME=""; LOCATION_TS=0; LOCATION_ATTEMPT_TS=0
+        LOCATION_SOURCE=""; LOCATION_IP=""; LOCATION_INTERFACE=""; LOCATION_METHOD=""
+        LOCATION_NEEDS_REPORT=1
+    elif [ -n "$COUNTRY" ] && location_ip_key "$LOCATION_IP" >/dev/null && [[ "$LOCATION_INTERFACE" =~ ^[A-Za-z0-9_.:-]{1,32}$ ]] && [[ "$LOCATION_METHOD" = ip || "$LOCATION_METHOD" = interface ]]; then
+        LOCATION_VERIFIED=1
+    else
+        COUNTRY=""; REGION=""; REGION_NAME=""; LOCATION_TS=0; LOCATION_SOURCE=""
+        LOCATION_IP=""; LOCATION_INTERFACE=""; LOCATION_METHOD=""
+    fi
     LAST_REPORTED_DOMAIN=$(env_get "$AGENT_ENV" LAST_REPORTED_DOMAIN)
 }
 
@@ -784,12 +846,12 @@ agent_env_ensure() {
     for k in MODE PORT UUID PATH DOMAIN METRICS_PORT CFIP REPORT_URL REPORT_TOKEN LAST_REPORTED_DOMAIN; do
         grep -q "^$k=" "$AGENT_ENV" || env_set "$AGENT_ENV" "$k" ""
     done
-    for k in NODE_ID NODE_NAME CHECK_INTERVAL WATCH_INTERVAL LAST_REPORT_TS LAST_DOMAIN_TS; do
+    for k in NODE_ID NODE_NAME CHECK_INTERVAL WATCH_INTERVAL CORE_LOGS LAST_REPORT_TS LAST_DOMAIN_TS; do
         if [ -z "$(env_get "$AGENT_ENV" "$k")" ]; then
             # 默认值集中在这里，迁移与全新安装得到相同配置。
             case "$k" in
                 NODE_ID) value=$(default_node_id) ;; NODE_NAME) value=$(node_name_clean "$(hostname -s)") ;;
-                CHECK_INTERVAL|WATCH_INTERVAL) value=$DEFAULT_CHECK_INTERVAL ;; *) value=0 ;;
+                CHECK_INTERVAL|WATCH_INTERVAL) value=$DEFAULT_CHECK_INTERVAL ;; CORE_LOGS) value=1 ;; *) value=0 ;;
             esac
             env_set "$AGENT_ENV" "$k" "$value" || return 1
         fi
@@ -808,7 +870,7 @@ install_self() {
         else install_bin "$source" "$SELF_SCRIPT" || return 3; fi
     else
         tmp=$(mktemp "$WORK_DIR/tunel-download.XXXXXX") || return 3
-        if ! http_fetch "$VENDOR_RAW_BASE/tunel.sh" "$tmp" || [ ! -s "$tmp" ] || ! bash -n "$tmp"; then
+        if ! http_fetch "$VENDOR_RAW_BASE/tunel.sh" "$tmp" 524288 || [ ! -s "$tmp" ] || ! bash -n "$tmp"; then
             rm -f "$tmp"; echo "错误: 无法下载可用脚本到 $SELF_SCRIPT" >&2; return 3
         fi
         install_bin "$tmp" "$SELF_SCRIPT" || { rm -f "$tmp"; return 3; }
@@ -933,8 +995,22 @@ svc_wrapper() {
         if [ "$TUNEL_SYSTEM" = 1 ]; then printf 'unset TUNEL_HOME\n'
         else printf "export TUNEL_HOME='%s'\n" "$TUNEL_HOME"; fi
         [ "$ENV_LOWMEM" != 1 ] || printf 'export GOGC=30\nexport GOMEMLIMIT=48MiB\n'
+        # 只降低过大的软限制，不提高普通用户已有的限制或硬限制。
+        cat <<'EOF'
+tunel_fd_limit=$(ulimit -Sn 2>/dev/null)
+case "$tunel_fd_limit" in
+    unlimited) ulimit -Sn 4096 2>/dev/null || true ;;
+    ''|*[!0-9]*) : ;;
+    *) [ "$tunel_fd_limit" -le 4096 ] || ulimit -Sn 4096 2>/dev/null || true ;;
+esac
+EOF
         # exec 让服务管理器直接追踪实际子进程。
-        printf 'exec %s\n' "$2"
+        if [ "$1" != "$SVC_AGENT" ] && [ "${CORE_LOGS:-1}" != 1 ]; then
+            # 显式禁用守护后无人限量日志，核心输出直接丢弃以免长期占盘。
+            printf 'exec %s >/dev/null 2>&1\n' "$2"
+        else
+            printf 'exec %s\n' "$2"
+        fi
     } > "$BIN_DIR/$1-run"
     chmod 755 "$BIN_DIR/$1-run"
 }
@@ -975,7 +1051,9 @@ User=root
 ExecStart=$BIN_DIR/$oname-run
 Restart=$policy
 RestartSec=$delay
-LimitNOFILE=infinity
+LimitNOFILE=4096
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=50
 $(svc_env_lines)
 [Install]
 WantedBy=multi-user.target
@@ -1192,13 +1270,13 @@ metrics_port_ensure() {
 }
 
 # 三种启动方式都启用本机 metrics，域名获取无需依赖横幅格式。
-argo_quick_args() { printf 'tunnel --no-autoupdate --edge-ip-version auto --protocol http2 --metrics 127.0.0.1:%s --url http://127.0.0.1:%s' "$MP" "$1"; }
+argo_quick_args() { printf 'tunnel --no-autoupdate --loglevel warn --edge-ip-version auto --protocol http2 --metrics 127.0.0.1:%s --url http://127.0.0.1:%s' "$MP" "$1"; }
 
 # token 值从文件读取，不进入 unit、wrapper 或 cloudflared 的进程参数。
-argo_token_args() { printf 'tunnel --no-autoupdate --edge-ip-version auto --protocol http2 --metrics 127.0.0.1:%s run --token-file "%s"' "$MP" "$ARGO_TOKEN_FILE"; }
+argo_token_args() { printf 'tunnel --no-autoupdate --loglevel warn --edge-ip-version auto --protocol http2 --metrics 127.0.0.1:%s run --token-file "%s"' "$MP" "$ARGO_TOKEN_FILE"; }
 
 # credentials 模式也通过相同的 metrics 端口判断边缘连接。
-argo_config_args() { printf 'tunnel --no-autoupdate --edge-ip-version auto --protocol http2 --metrics 127.0.0.1:%s --config "%s" run' "$MP" "$TUNNEL_YML"; }
+argo_config_args() { printf 'tunnel --no-autoupdate --loglevel warn --edge-ip-version auto --protocol http2 --metrics 127.0.0.1:%s --config "%s" run' "$MP" "$TUNNEL_YML"; }
 
 # 凭据 JSON 和 YML 用私有权限保存，域名与端口已经经过 CLI 校验。
 argo_write_creds() {
@@ -1256,7 +1334,7 @@ wait_new_domain() {
         d=$(get_domain 9>&-)
         if [ -n "$d" ] && [ "$d" != "$old" ]; then WAIT_DOMAIN=$d; printf '%s' "$d"; return 0; fi
         [ "$elapsed" -lt "$timeout" ] || break
-        sleep 2 9>&-; elapsed=$((elapsed+2))
+        agent_sleep 2 || return 1; elapsed=$((elapsed+2))
     done
     return 1
 }
@@ -1289,6 +1367,16 @@ json_escape() {
 }
 
 # VMess 的连接地址缺省为隧道域名；Host 与 SNI 始终使用隧道域名。
+node_display_name() {
+    local location=""
+    if [ -n "${COUNTRY:-}" ]; then
+        location=$COUNTRY
+        if [ -n "${REGION_NAME:-}" ]; then location+=" · $REGION_NAME"
+        elif [ -n "${REGION:-}" ]; then location+="-$REGION"; fi
+    fi
+    printf '%s' "${location:-未识别地区}"
+}
+
 vmess_link() {
     local domain=$1 uuid=$2 path=$3 cfip=${4:-$1} ps=$5 json
     json=$(printf '{"v":"2","ps":"%s","add":"%s","port":"443","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s?ed=2560","tls":"tls","sni":"%s","alpn":"","fp":"firefox"}' \
@@ -1302,7 +1390,7 @@ nodes_refresh() {
     umask 077
     mkdir -p -m 700 "$NODE_DIR" || return 1
     chmod 700 "$NODE_DIR"
-    link=$(vmess_link "$DOMAIN" "$UUID" "$WS_PATH" "${CFIP:-$DOMAIN}" "$NODE_NAME")
+    link=$(vmess_link "$DOMAIN" "$UUID" "$WS_PATH" "${CFIP:-$DOMAIN}" "$(node_display_name)")
     printf '%s\n' "$link" > "$NODE_DIR/$MODE.txt"
     printf 'MODE=%s\nPORT=%s\nUUID=%s\nPATH=%s\nDOMAIN=%s\n' "$MODE" "$PORT" "$UUID" "$WS_PATH" "$DOMAIN" > "$NODE_DIR/$MODE.env"
     chmod 600 "$NODE_DIR/$MODE.env" "$NODE_DIR/$MODE.txt"
@@ -1310,11 +1398,17 @@ nodes_refresh() {
 }
 
 # 服务描述与目录保持既有名称，使升级后卸载仍能找到旧安装。
-sb_service_up() { svc_install "$SVC_SB" "$SVC_SB" "tunel VMess-WS" "\"$SB_BIN\" run -c \"$SB_CFG\"" "$LOG_DIR" on-failure; }
+sb_service_up() {
+    local output="$LOG_DIR/access.log" error="$LOG_DIR/error.log"
+    [ "${CORE_LOGS:-1}" = 1 ] || { output=/dev/null; error=/dev/null; }
+    svc_install "$SVC_SB" "$SVC_SB" "tunel VMess-WS" "\"$SB_BIN\" run -c \"$SB_CFG\" >> \"$output\" 2>> \"$error\"" "$LOG_DIR" on-failure
+}
 
 # shell -c 中 exec 让 cloudflared 成为直接受监管的进程。
 argo_service_up() {
-    svc_install "$SVC_ARGO" "$SVC_ARGO" "tunel (cloudflared)" "/bin/sh -c 'exec \"$CF_BIN\" $2 >> \"$ARGO_LOG\" 2>&1'" "$LOG_DIR" on-failure
+    local output=$ARGO_LOG
+    [ "${CORE_LOGS:-1}" = 1 ] || output=/dev/null
+    svc_install "$SVC_ARGO" "$SVC_ARGO" "tunel (cloudflared)" "/bin/sh -c 'exec \"$CF_BIN\" $2 >> \"$output\" 2>&1'" "$LOG_DIR" on-failure
 }
 
 # 读取已保存的固定凭据，恢复时无需用户重新输入密钥。
@@ -1325,18 +1419,60 @@ argo_service_configure() {
     else echo "错误: 固定隧道缺少 token 文件或 JSON，请重新执行 fixed 安装" >&2; return 1; fi
 }
 
-# 日志时间统一 UTC，超过 1MB 保留末尾 512KB 限制磁盘占用。
-agent_log() {
-    local level=$1 msg=$2 size tmp
+LOG_MAX_BYTES=262144
+LOG_KEEP_BYTES=65536
+RESOURCE_MAINTENANCE_INTERVAL=30
+
+# stat 只读大小；旧 minimal 环境退回流式 wc，不把整份日志装进内存。
+log_file_size() {
+    local size
+    if has stat; then size=$(stat -c %s "$1" 2>/dev/null) || return 1
+    else size=$(wc -c < "$1" 2>/dev/null) || return 1; fi
+    size=${size//[[:space:]]/}
+    [[ "$size" =~ ^[0-9]{1,18}$ ]] || return 1
+    printf '%s' "$size"
+}
+
+# 保留同一 inode，运行中 O_APPEND 的日志 FD 不会继续写入被改名的旧文件。
+log_trim_in_place() (
+    local file=$1 size tmp=""
+    trap - EXIT TERM INT
+    exec 7>&- 9>&-
+    [ -f "$file" ] && [ ! -L "$file" ] && [ -w "$file" ] || return 0
+    size=$(log_file_size "$file") || return 1
+    [ "$size" -gt "$LOG_MAX_BYTES" ] || return 0
     umask 077
-    mkdir -p -m 700 "$WORK_DIR"
-    chmod 700 "$WORK_DIR"
-    printf '%s [%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$level" "$msg" >> "$AGENT_LOG"
-    size=$(wc -c < "$AGENT_LOG")
-    if [ "$size" -gt 1048576 ]; then
-        tmp=$(mktemp "$AGENT_LOG.XXXXXX") || return 0
-        tail -c 524288 "$AGENT_LOG" > "$tmp" && mv -f "$tmp" "$AGENT_LOG"
+    tmp=$(mktemp "$TMP_DIR/log-trim.XXXXXX") || { : > "$file"; return $?; }
+    trap 'rm -f "$tmp"' EXIT
+    trap 'exit 1' TERM INT
+    # 尾部副本有固定上限；磁盘已满时直接截空日志，优先释放空间。
+    if ! tail -c "$LOG_KEEP_BYTES" "$file" > "$tmp"; then
+        rm -f "$tmp"
+        : > "$file"
+        return $?
     fi
+    cat "$tmp" > "$file"
+)
+
+# 固定枚举本安装的四个文本日志，每 30 秒限量一次，不扫描用户磁盘。
+resource_maintenance() {
+    local now=$1 file
+    [ "$((now-${RESOURCE_LAST_MAINTENANCE_TS:-0}))" -ge "$RESOURCE_MAINTENANCE_INTERVAL" ] || return 0
+    RESOURCE_LAST_MAINTENANCE_TS=$now
+    for file in "$AGENT_LOG" "$ARGO_LOG" "$LOG_DIR/access.log" "$LOG_DIR/error.log"; do
+        log_trim_in_place "$file" || printf '警告: 日志限量失败: %s\n' "$file" >&2
+    done
+    return 0
+}
+
+# 日志是尽力写入的诊断，磁盘错误不能阻止隧道恢复或节点上报。
+agent_log() {
+    local level=$1 msg=$2
+    umask 077
+    [ -d "$WORK_DIR" ] || mkdir -p -m 700 "$WORK_DIR" || return 0
+    printf '%s [%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$level" "$msg" >> "$AGENT_LOG" || return 0
+    log_trim_in_place "$AGENT_LOG" || true
+    return 0
 }
 
 # 每个探针失败都给出含义，便于区分本地入站与边缘问题。
@@ -1350,21 +1486,343 @@ probe_log() {
     agent_log WARN "$where 探针 HTTP ${WS_LAST_CODE:-000}: $meaning"
 }
 
-# 发送失败仅对 5xx/000 重试，不修改已上报标记，下一次 A/B 可补发。
+# 规范化真实公网地址，排除本地、NAT、保留地址与 WARP 的私有地址。
+location_ip_key() {
+    local value=$1 i part first second missing result=""
+    local -a blocks=() left=() right=() parts=()
+    if [[ "$value" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        IFS=. read -r -a blocks <<< "$value"
+        for i in 0 1 2 3; do
+            part=$((10#${blocks[i]})); [ "$part" -le 255 ] || return 1
+            blocks[i]=$part
+        done
+        first=${blocks[0]}; second=${blocks[1]}
+        if [ "$first" -eq 0 ] || [ "$first" -ge 224 ] || [ "$first" -eq 10 ] || [ "$first" -eq 127 ] ||
+            { [ "$first" -eq 100 ] && [ "$second" -ge 64 ] && [ "$second" -le 127 ]; } ||
+            { [ "$first" -eq 169 ] && [ "$second" -eq 254 ]; } ||
+            { [ "$first" -eq 172 ] && [ "$second" -ge 16 ] && [ "$second" -le 31 ]; } ||
+            { [ "$first" -eq 192 ] && { [ "$second" -eq 168 ] || { [ "$second" -eq 0 ] && { [ "${blocks[2]}" -eq 0 ] || [ "${blocks[2]}" -eq 2 ]; }; } || { [ "$second" -eq 88 ] && [ "${blocks[2]}" -eq 99 ]; }; }; } ||
+            { [ "$first" -eq 198 ] && { [ "$second" -eq 18 ] || [ "$second" -eq 19 ] || { [ "$second" -eq 51 ] && [ "${blocks[2]}" -eq 100 ]; }; }; } ||
+            { [ "$first" -eq 203 ] && [ "$second" -eq 0 ] && [ "${blocks[2]}" -eq 113 ]; }; then return 1; fi
+        printf '%s.%s.%s.%s' "${blocks[@]}"
+        return 0
+    fi
+    [[ "$value" =~ ^[0-9A-Fa-f:]{2,39}$ && "$value" != *:::* ]] || return 1
+    [[ "$value" != :* || "$value" = ::* ]] && [[ "$value" != *: || "$value" = *:: ]] || return 1
+    if [[ "$value" = *::* ]]; then
+        part=${value#*::}; [[ "$part" != *::* ]] || return 1
+        IFS=: read -r -a left <<< "${value%%::*}"
+        IFS=: read -r -a right <<< "$part"
+        missing=$((8-${#left[@]}-${#right[@]})); [ "$missing" -gt 0 ] || return 1
+        parts=("${left[@]}")
+        for ((i=0;i<missing;i++)); do parts+=(0); done
+        parts+=("${right[@]}")
+    else
+        IFS=: read -r -a parts <<< "$value"
+        [ "${#parts[@]}" -eq 8 ] && [[ "$value" != :* && "$value" != *: ]] || return 1
+    fi
+    for i in 0 1 2 3 4 5 6 7; do
+        part=${parts[i]}; [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        parts[i]=$((16#$part))
+    done
+    first=${parts[0]}; second=${parts[1]}
+    [ "$first" -ge 8192 ] && [ "$first" -le 16383 ] || return 1
+    [ "$first" -ne 8193 ] || [ "$second" -ne 3512 ] || return 1
+    for part in "${parts[@]}"; do printf -v part '%x' "$part"; result+="${result:+:}$part"; done
+    printf '%s' "$result"
+}
+
+location_interface_valid() {
+    [[ "$1" =~ ^[A-Za-z0-9_.:-]{1,32}$ ]] || return 1
+    case "$1" in lo|*[wW][aA][rR][pP]*|[wW][gG]*|[aA][wW][gG]*|[tT][uU][nN]*|[tT][aA][pP]*) return 1 ;; esac
+    [ "$(cat "/sys/class/net/$1/type" 2>/dev/null)" = 1 ]
+}
+
+# 只读 main 默认路由；不改 WARP、路由表或系统代理。
+location_select_route() {
+    local family routes device address key preferred fallback_device="" fallback_family=""
+    LOCATION_QUERY_MODE=""; LOCATION_QUERY_IP=""; LOCATION_QUERY_INTERFACE=""; LOCATION_QUERY_FAMILY=""
+    for family in 4 6; do
+        routes=""
+        if has ip; then
+            routes=$(ip -"$family" route show table main default 2>/dev/null | awk '
+                !/linkdown/ {dev="";metric=0;src="-";for(i=1;i<=NF;i++){if($i=="dev")dev=$(i+1);if($i=="metric")metric=$(i+1);if($i=="src")src=$(i+1)} if(dev!="")print metric,dev,src}' | sort -sn)
+        fi
+        if [ -z "$routes" ] && [ "$family" = 4 ] && [ -r /proc/net/route ]; then
+            routes=$(awk 'NR>1 && $2=="00000000" && $8=="00000000" && $4 ~ /[13579bBdDfF]$/ {print $7,$1,"-"}' /proc/net/route | sort -sn)
+        fi
+        while read -r key device preferred; do
+            location_interface_valid "$device" || continue
+            if [ -z "$fallback_device" ]; then fallback_device=$device; fallback_family=$family; fi
+            if has ip; then
+                while read -r address; do
+                    key=$(location_ip_key "$address") || continue
+                    LOCATION_QUERY_MODE=ip; LOCATION_QUERY_IP=$key; LOCATION_QUERY_INTERFACE=$device; LOCATION_QUERY_FAMILY=$family
+                    return 0
+                done < <(ip -"$family" -o address show dev "$device" scope global 2>/dev/null | awk -v preferred="$preferred" '
+                    !/ tentative | dadfailed | deprecated / {split($4,a,"/");if(a[1]==preferred)print a[1];else other=other a[1] "\n"} END {printf "%s",other}')
+            fi
+            # 每种地址族只使用首选普通默认接口，不拿备用网卡的位置替代 NAT 出口。
+            break
+        done <<< "$routes"
+    done
+    [ -n "$fallback_device" ] || return 1
+    LOCATION_QUERY_MODE=interface; LOCATION_QUERY_INTERFACE=$fallback_device; LOCATION_QUERY_FAMILY=$fallback_family
+}
+
+location_country_valid() {
+    [[ "$1" =~ ^[A-Z]{2}$ ]] || return 1
+    case ' AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS XK YE YT ZA ZM ZW ' in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
+
+location_region_name_valid() {
+    local LC_ALL=C control=$'\xc2[\x80-\x9f]'
+    [[ "${#1}" -le 128 && ! "$1" =~ [[:cntrl:]] && ! "$1" =~ $control ]]
+}
+
+# 提取 JSON 根对象的字符串字段，ASN 可允许数字；不增加 jq/Python 依赖。
+location_json_string() {
+    LC_ALL=C awk -v wanted="$1" -v numeric="${2:-0}" '
+    function hex(s,    n,i,d) {
+        n=0
+        for (i=1;i<=length(s);i++) {
+            d=index("0123456789abcdef",tolower(substr(s,i,1)))-1
+            if (d<0) return -1
+            n=n*16+d
+        }
+        return n
+    }
+    function utf8(c) {
+        if (c<128) return sprintf("%c",c)
+        if (c<2048) return sprintf("%c%c",192+int(c/64),128+c%64)
+        if (c<65536) return sprintf("%c%c%c",224+int(c/4096),128+int(c/64)%64,128+c%64)
+        return sprintf("%c%c%c%c",240+int(c/262144),128+int(c/4096)%64,128+int(c/64)%64,128+c%64)
+    }
+    function string_value(allow_control,    out,c,code,low) {
+        out=""; string_ok=0
+        for (pos++;pos<=length(data);pos++) {
+            c=substr(data,pos,1)
+            if (c=="\"") { pos++; string_ok=1; return out }
+            if (c=="\\") {
+                c=substr(data,++pos,1)
+                if (c=="u") {
+                    if (length(substr(data,pos+1,4))!=4) return ""
+                    code=hex(substr(data,pos+1,4)); pos+=4
+                    if (code<0) return ""
+                    if (code>=55296 && code<=56319) {
+                        if (substr(data,pos+1,2)!="\\u") return ""
+                        low=hex(substr(data,pos+3,4))
+                        if (low<56320 || low>57343) return ""
+                        code=65536+(code-55296)*1024+low-56320; pos+=6
+                    } else if (code>=56320 && code<=57343) return ""
+                    if (code<32 || (code>=127 && code<=159)) {
+                        if (!allow_control) return ""
+                        out=out " "
+                    } else out=out utf8(code)
+                } else if (c=="\"" || c=="\\" || c=="/") out=out c
+                else if (c=="b" || c=="f" || c=="n" || c=="r" || c=="t") {
+                    if (!allow_control) return ""
+                    out=out " "
+                } else return ""
+            } else {
+                if (c ~ /[[:cntrl:]]/) return ""
+                out=out c
+            }
+        }
+        return ""
+    }
+    { data=data $0 "\n" }
+    END {
+        if (data !~ /^[[:space:]]*\{/ || data !~ /\}[[:space:]]*$/) exit 1
+        pos=1; depth=0
+        while (pos<=length(data)) {
+            c=substr(data,pos,1)
+            if (c=="\"") {
+                value=string_value(1)
+                if (!string_ok) exit 1
+                if (depth==1 && value==wanted) {
+                    while (substr(data,pos,1) ~ /[[:space:]]/) pos++
+                    if (substr(data,pos,1)==":") {
+                        pos++
+                        while (substr(data,pos,1) ~ /[[:space:]]/) pos++
+                        if (substr(data,pos,1)!="\"") {
+                            if (!numeric || !match(substr(data,pos),/^[0-9]+/)) exit 1
+                            value=substr(data,pos,RLENGTH)
+                            if (substr(data,pos+RLENGTH) !~ /^[[:space:]]*[,}]/) exit 1
+                            printf "%s",value; exit 0
+                        }
+                        value=string_value()
+                        if (!string_ok) exit 1
+                        printf "%s",value; exit 0
+                    }
+                }
+                continue
+            }
+            if (c=="{" || c=="[") depth++
+            else if (c=="}" || c=="]") depth--
+            pos++
+        }
+        exit 1
+    }'
+}
+
+location_parse() {
+    local response=$1 country region="" name="" status
+    if [ "${5:-}" = success ]; then
+        status=$(printf '%s' "$response" | location_json_string status) || return 1
+        [ "$status" = success ] || return 1
+    fi
+    country=$(printf '%s' "$response" | location_json_string "$2" | LC_ALL=C tr '[:lower:]' '[:upper:]')
+    location_country_valid "$country" || return 1
+    [ -z "$3" ] || region=$(printf '%s' "$response" | location_json_string "$3")
+    [[ "$region" =~ ^[A-Za-z0-9_-]{1,16}$ ]] || region=""
+    [ -z "$4" ] || name=$(printf '%s' "$response" | location_json_string "$4")
+    location_region_name_valid "$name" || name=""
+    LOCATION_NEXT_COUNTRY=$country; LOCATION_NEXT_REGION=$region; LOCATION_NEXT_REGION_NAME=$name
+}
+
+# 国家、地区和缓存时间一次原子保存，失败保留整组旧位置。
+location_cache_save() {
+    local tmp reset=${10:-0}
+    umask 077
+    tmp=$(mktemp "${AGENT_ENV}.XXXXXX") || return 1
+    if [ -f "$AGENT_ENV" ]; then
+        awk -v reset="$reset" '!/^(COUNTRY|REGION|REGION_NAME|LOCATION_TS|LOCATION_SOURCE|LOCATION_ATTEMPT_TS|LOCATION_POLICY|LOCATION_IP|LOCATION_INTERFACE|LOCATION_METHOD)=/ && !(reset==1 && /^LAST_REPORTED_DOMAIN=/)' "$AGENT_ENV" > "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    if ! printf 'COUNTRY=%s\nREGION=%s\nREGION_NAME=%s\nLOCATION_TS=%s\nLOCATION_SOURCE=%s\nLOCATION_ATTEMPT_TS=%s\nLOCATION_POLICY=native-v1\nLOCATION_IP=%s\nLOCATION_INTERFACE=%s\nLOCATION_METHOD=%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" >> "$tmp"; then
+        rm -f "$tmp"; return 1
+    fi
+    if [ "$reset" = 1 ]; then printf 'LAST_REPORTED_DOMAIN=\n' >> "$tmp" || { rm -f "$tmp"; return 1; }; fi
+    if ! chmod 600 "$tmp" || ! mv -f "$tmp" "$AGENT_ENV"; then
+        rm -f "$tmp"; return 1
+    fi
+}
+
+location_verify_response() {
+    local response=$1 value key owners="" asn field known=0
+    value=$(printf '%s' "$response" | location_json_string "$2") || return 1
+    key=$(location_ip_key "$value") || return 1
+    if [ "$LOCATION_QUERY_MODE" = ip ] && [ "$key" != "$LOCATION_QUERY_IP" ]; then return 1; fi
+    asn=$(printf '%s' "$response" | location_json_string asn 1)
+    if [[ "$asn" =~ ^[0-9]{1,10}$ ]] && [ "$((10#$asn))" -gt 0 ] && [ "$((10#$asn))" -le 4294967295 ]; then known=1; fi
+    for field in org as isp organization asn_organization; do
+        value=$(printf '%s' "$response" | location_json_string "$field")
+        case "$value" in ''|Unknown|unknown|null|None|none|N/A|n/a) continue ;; esac
+        owners+=" $value"; known=1
+    done
+    if [[ "$owners" =~ [Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee] ]] ||
+        [[ "$asn" =~ (^|[^0-9])13335([^0-9]|$) ]] ||
+        [[ "$owners" =~ [Aa][Ss][[:space:]]*13335([^0-9]|$) ]]; then return 1; fi
+    [ "$known" = 1 ] || return 1
+    LOCATION_NEXT_IP=$key
+}
+
+location_fetch() {
+    local url=$1 response rc LC_ALL=C
+    local -a binding=()
+    shift
+    [ "${STOP:-0}" != 1 ] || return 1
+    if [ "$LOCATION_QUERY_MODE" = interface ]; then
+        binding=("-$LOCATION_QUERY_FAMILY" --interface "if!$LOCATION_QUERY_INTERFACE")
+    fi
+    # head 另设读取上限，兼容旧 curl 对无 Content-Length 响应的限制不足。
+    response=$(
+        exec 7>&- 9>&-
+        set -o pipefail
+        curl -q -fsS --proxy '' --noproxy '*' --connect-timeout 3 -m 6 --max-filesize 4096 -A "tunel/$TUNEL_VERSION" "${binding[@]}" "$@" "$url" 2>/dev/null | head -c 4097
+    ); rc=$?
+    [ "$rc" = 0 ] && [ "${#response}" -le 4096 ] || return 1
+    printf '%s' "$response"
+}
+
+# 指定真实公网 IP 查询；NAT 只绑定普通接口发现出口，不放宽为 WARP 默认路由。
+location_refresh() {
+    local now age provider response endpoint source="" reset=${LOCATION_NEEDS_REPORT:-0} route_ok=0
+    location_select_route && route_ok=1
+    now=$(date +%s)
+    age=$((now-10#${LOCATION_TS:-0}))
+    if [ "${LOCATION_VERIFIED:-0}" = 1 ] && [ -n "${LOCATION_SOURCE:-}" ] && [ "$age" -ge 0 ] && [ "$age" -lt 86400 ] &&
+        [ "$route_ok" = 1 ] && [ "$LOCATION_INTERFACE" = "$LOCATION_QUERY_INTERFACE" ] && [ "$LOCATION_METHOD" = "$LOCATION_QUERY_MODE" ] &&
+        { [ "$LOCATION_QUERY_MODE" != ip ] || [ "$LOCATION_IP" = "$LOCATION_QUERY_IP" ]; }; then return 0; fi
+    age=$((now-10#${LOCATION_ATTEMPT_TS:-0}))
+    if [ "${LOCATION_ATTEMPT_TS:-0}" != 0 ] && [ "$age" -ge 0 ] && [ "$age" -lt 300 ]; then return 0; fi
+    age=$((now-10#$LOCATION_MEMORY_ATTEMPT_TS))
+    if [ "$LOCATION_MEMORY_ATTEMPT_TS" != 0 ] && [ "$age" -ge 0 ] && [ "$age" -lt 300 ]; then return 0; fi
+    LOCATION_MEMORY_ATTEMPT_TS=$now
+    for provider in ipinfo ip.sb ip-api ip-api-http worker; do
+        [ "${STOP:-0}" != 1 ] || return 0
+        [ "$route_ok" = 1 ] || break
+        resource_maintenance "$(date +%s)"
+        case "$provider" in
+            ipinfo)
+                endpoint='https://ipinfo.io/json'
+                [ "$LOCATION_QUERY_MODE" != ip ] || endpoint="https://ipinfo.io/$LOCATION_QUERY_IP/json"
+                response=$(location_fetch "$endpoint") || continue
+                location_verify_response "$response" ip || continue
+                location_parse "$response" country '' region || continue ;;
+            ip.sb)
+                endpoint='https://api.ip.sb/geoip'
+                [ "$LOCATION_QUERY_MODE" != ip ] || endpoint+="/$LOCATION_QUERY_IP"
+                response=$(location_fetch "$endpoint") || continue
+                location_verify_response "$response" ip || continue
+                location_parse "$response" country_code region_code region || continue ;;
+            ip-api|ip-api-http)
+                if [ "$provider" = ip-api ]; then endpoint='https://ip-api.com/json'
+                else endpoint='http://ip-api.com/json'; fi
+                [ "$LOCATION_QUERY_MODE" != ip ] || endpoint+="/$LOCATION_QUERY_IP"
+                response=$(location_fetch "$endpoint") || continue
+                location_verify_response "$response" query || continue
+                location_parse "$response" countryCode region regionName success || continue ;;
+            worker)
+                [ "$LOCATION_QUERY_MODE" = interface ] || continue
+                [ -n "$REPORT_URL" ] && [ -n "$REPORT_TOKEN" ] || continue
+                response=$(location_fetch "${REPORT_URL%/api/report}/api/location" -H "Authorization: Bearer $REPORT_TOKEN") || continue
+                location_verify_response "$response" ip || continue
+                location_parse "$response" country region regionName || continue ;;
+        esac
+        source=$provider; [ "$source" != ip-api-http ] || source=ip-api
+        break
+    done
+    [ "${STOP:-0}" != 1 ] || return 0
+    now=$(date +%s)
+    if [ -z "$source" ]; then
+        location_cache_save "${COUNTRY:-}" "${REGION:-}" "${REGION_NAME:-}" "${LOCATION_TS:-0}" "${LOCATION_SOURCE:-}" "$now" "${LOCATION_IP:-}" "${LOCATION_INTERFACE:-}" "${LOCATION_METHOD:-}" "$reset" || return 0
+        LOCATION_ATTEMPT_TS=$now; LOCATION_POLICY=native-v1; LOCATION_NEEDS_REPORT=0
+        [ "$reset" != 1 ] || LAST_REPORTED_DOMAIN=""
+        if [ "$reset" = 1 ] && [ -n "${DOMAIN:-}" ]; then nodes_refresh || true; fi
+        return 0
+    fi
+    if [ "${LOCATION_VERIFIED:-0}" != 1 ] || [ "$COUNTRY" != "$LOCATION_NEXT_COUNTRY" ] || [ "$REGION" != "$LOCATION_NEXT_REGION" ] || [ "$REGION_NAME" != "$LOCATION_NEXT_REGION_NAME" ]; then reset=1; fi
+    location_cache_save "$LOCATION_NEXT_COUNTRY" "$LOCATION_NEXT_REGION" "$LOCATION_NEXT_REGION_NAME" "$now" "$source" "$now" "$LOCATION_NEXT_IP" "$LOCATION_QUERY_INTERFACE" "$LOCATION_QUERY_MODE" "$reset" || return 0
+    COUNTRY=$LOCATION_NEXT_COUNTRY; REGION=$LOCATION_NEXT_REGION; REGION_NAME=$LOCATION_NEXT_REGION_NAME
+    LOCATION_TS=$now; LOCATION_SOURCE=$source; LOCATION_ATTEMPT_TS=$now; LOCATION_POLICY=native-v1
+    LOCATION_IP=$LOCATION_NEXT_IP; LOCATION_INTERFACE=$LOCATION_QUERY_INTERFACE; LOCATION_METHOD=$LOCATION_QUERY_MODE
+    LOCATION_VERIFIED=1; LOCATION_NEEDS_REPORT=0
+    [ "$reset" != 1 ] || LAST_REPORTED_DOMAIN=""
+    [ -z "${DOMAIN:-}" ] || nodes_refresh || true
+}
+
+# 发送失败仅对 5xx/000 重试，不修改已上报标记，下一轮可补发。
 report_node() {
     agent_load
+    location_refresh
     [ -n "$REPORT_URL" ] || return 0
-    local body resp code now link attempt delay
+    local body resp code now link attempt delay verified=false
     [ -n "$REPORT_TOKEN" ] && [ -n "$DOMAIN" ] || { agent_log ERR "上报配置缺少 token 或域名"; return 1; }
     umask 077
     body=$(mktemp) || return 1; resp=$(mktemp) || { rm -f "$body"; return 1; }
     now=$(date +%s)
-    link=$(vmess_link "$DOMAIN" "$UUID" "$WS_PATH" "${CFIP:-$DOMAIN}" "$NODE_NAME")
-    printf '{"id":"%s","name":"%s","mode":"%s","link":"%s","host":"%s","addr":"%s","port":443,"uuid":"%s","path":"%s","net":"ws","tls":true,"sni":"%s","version":"%s","ts":%s}' \
-        "$(json_escape "$NODE_ID")" "$(json_escape "$NODE_NAME")" "$MODE" "$(json_escape "$link")" "$DOMAIN" "$(json_escape "${CFIP:-$DOMAIN}")" "$UUID" "$(json_escape "$WS_PATH")" "$DOMAIN" "$TUNEL_VERSION" "$now" > "$body"
+    link=$(vmess_link "$DOMAIN" "$UUID" "$WS_PATH" "${CFIP:-$DOMAIN}" "$(node_display_name)")
+    [ "${LOCATION_VERIFIED:-0}" != 1 ] || verified=true
+    printf '{"id":"%s","name":"%s","mode":"%s","link":"%s","host":"%s","addr":"%s","port":443,"uuid":"%s","path":"%s","country":"%s","region":"%s","regionName":"%s","locationVerified":%s,"net":"ws","tls":true,"sni":"%s","version":"%s","ts":%s}' \
+        "$(json_escape "$NODE_ID")" "$(json_escape "$NODE_NAME")" "$MODE" "$(json_escape "$link")" "$DOMAIN" "$(json_escape "${CFIP:-$DOMAIN}")" "$UUID" "$(json_escape "$WS_PATH")" "${COUNTRY:-}" "${REGION:-}" "$(json_escape "${REGION_NAME:-}")" "$verified" "$DOMAIN" "$TUNEL_VERSION" "$now" > "$body"
     for attempt in 0 1 2 3; do
         [ "${STOP:-0}" != 1 ] || break
-        code=$(exec 9>&-; curl -sS -m 15 -o "$resp" -w '%{http_code}' -X POST -H "Authorization: Bearer $REPORT_TOKEN" -H 'Content-Type: application/json' --data-binary "@$body" "$REPORT_URL" 9>&- 2>/dev/null)
+        resource_maintenance "$(date +%s)"
+        code=$(exec 9>&-; curl -sS -m 15 --max-filesize 65536 -o "$resp" -w '%{http_code}' -X POST -H "Authorization: Bearer $REPORT_TOKEN" -H 'Content-Type: application/json' --data-binary "@$body" "$REPORT_URL" 9>&- 2>/dev/null)
         code=${code:-000}
         case "$code" in
             200)
@@ -1398,7 +1856,7 @@ report_delete() {
     umask 077
     body=$(mktemp) || return 1; resp=$(mktemp) || { rm -f "$body"; return 1; }
     printf '{"id":"%s"}' "$(json_escape "$NODE_ID")" > "$body"
-    code=$(exec 9>&-; curl -sS -m 15 -o "$resp" -w '%{http_code}' -X POST -H "Authorization: Bearer $REPORT_TOKEN" -H 'Content-Type: application/json' --data-binary "@$body" "${REPORT_URL%/api/report}/api/node/delete" 2>/dev/null)
+    code=$(exec 9>&-; curl -sS -m 15 --max-filesize 65536 -o "$resp" -w '%{http_code}' -X POST -H "Authorization: Bearer $REPORT_TOKEN" -H 'Content-Type: application/json' --data-binary "@$body" "${REPORT_URL%/api/report}/api/node/delete" 2>/dev/null)
     rm -f "$body" "$resp"
     if [ "$code" = 200 ]; then agent_log INFO "节点已注销: $NODE_ID"; else agent_log WARN "注销失败 HTTP ${code:-000}，请在 Worker 面板删除节点"; return 1; fi
 }
@@ -1408,6 +1866,7 @@ agent_sleep() {
     local left=$1 chunk
     while [ "$left" -gt 0 ]; do
         [ "${STOP:-0}" != 1 ] || return 1
+        resource_maintenance "$(date +%s)"
         chunk=5; [ "$left" -ge 5 ] || chunk=$left
         sleep "$chunk" 9>&-; left=$((left-chunk))
     done
@@ -1447,6 +1906,9 @@ install_env_write() {
     env_set "$AGENT_ENV" UUID "$UUID"
     env_set "$AGENT_ENV" PATH "$WS_PATH"
     env_set "$AGENT_ENV" DOMAIN "$DOMAIN"
+    CORE_LOGS=1
+    [ "${NO_AGENT:-0}" != 1 ] || CORE_LOGS=0
+    env_set "$AGENT_ENV" CORE_LOGS "$CORE_LOGS" || return 1
     for key in NAME CFIP NODE_ID REPORT_URL REPORT_TOKEN CHECK WATCH; do
         case "$key" in
             NAME) val=${OPT_NAME:-}; key=NODE_NAME ;; CFIP) val=${OPT_CFIP:-} ;;
@@ -1506,7 +1968,8 @@ install_tunnel() {
     if install_self; then
         # 首次成功安装立即上报，守护启动只会补发失败或不同的域名。
         report_node || true
-        if [ "${NO_AGENT:-0}" != 1 ] && [ -n "$REPORT_URL" ] && [ -n "$REPORT_TOKEN" ]; then agent_start || rc=$?; fi
+        # 没有上报配置也守护独立隧道，同时负责文本日志限量。
+        if [ "${NO_AGENT:-0}" != 1 ]; then agent_start || rc=$?; fi
     else
         rc=3
     fi
@@ -1557,12 +2020,32 @@ tunnel_refresh_domain() {
 agent_state_load() {
     LAST_CHECK_TS=$(env_get "$AGENT_STATE" LAST_CHECK_TS); LAST_CHECK_TS=${LAST_CHECK_TS:-0}
     LAST_WATCH_TS=$(env_get "$AGENT_STATE" LAST_WATCH_TS); LAST_WATCH_TS=${LAST_WATCH_TS:-0}
+    [[ "$LAST_CHECK_TS" =~ ^[0-9]{1,12}$ ]] || LAST_CHECK_TS=0
+    [[ "$LAST_WATCH_TS" =~ ^[0-9]{1,12}$ ]] || LAST_WATCH_TS=0
+    AGENT_STATE_SAVED_CHECK_TS=""; AGENT_STATE_SAVED_WATCH_TS=""; AGENT_STATE_RETRY_AFTER=0
+    if [ -f "$AGENT_STATE" ]; then
+        AGENT_STATE_SAVED_CHECK_TS=$LAST_CHECK_TS
+        AGENT_STATE_SAVED_WATCH_TS=$LAST_WATCH_TS
+    fi
 }
 
-# 成功与失败都保存本轮时间，下一轮仍按配置周期执行。
+# 时间未变化时不写盘；变化时一次原子保存，写失败也不每五秒反复创建临时文件。
 agent_state_save() {
-    env_set "$AGENT_STATE" LAST_CHECK_TS "$LAST_CHECK_TS"
-    env_set "$AGENT_STATE" LAST_WATCH_TS "$LAST_WATCH_TS"
+    local now tmp
+    if [ -f "$AGENT_STATE" ] && [ "$LAST_CHECK_TS" = "${AGENT_STATE_SAVED_CHECK_TS:-}" ] && [ "$LAST_WATCH_TS" = "${AGENT_STATE_SAVED_WATCH_TS:-}" ]; then return 0; fi
+    now=${1:-$(date +%s)}
+    [ "$now" -ge "${AGENT_STATE_RETRY_AFTER:-0}" ] || return 0
+    AGENT_STATE_RETRY_AFTER=$((now+RESOURCE_MAINTENANCE_INTERVAL))
+    umask 077
+    tmp=$(mktemp "$TMP_DIR/agent-state.XXXXXX") || return 1
+    if ! printf 'LAST_CHECK_TS=%s\nLAST_WATCH_TS=%s\n' "$LAST_CHECK_TS" "$LAST_WATCH_TS" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$AGENT_STATE"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    AGENT_STATE_SAVED_CHECK_TS=$LAST_CHECK_TS
+    AGENT_STATE_SAVED_WATCH_TS=$LAST_WATCH_TS
+    AGENT_STATE_RETRY_AFTER=0
+    return 0
 }
 
 # 每轮只判断一次连接，任一失败直接交给隧道重建，不重试探测。
@@ -1600,6 +2083,7 @@ agent_startup() {
         DOMAIN=$d; env_set "$AGENT_ENV" DOMAIN "$DOMAIN"; env_set "$AGENT_ENV" LAST_DOMAIN_TS "$(date +%s)"
         nodes_refresh
     fi
+    location_refresh
     if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_node || true; fi
 }
 
@@ -1628,6 +2112,7 @@ agent_watch() {
 agent_check() {
     local now=$1 d
     LAST_CHECK_TS=$now; LAST_WATCH_TS=$now
+    core_tmp_cleanup || true
     # 自动拉起的 cloudflared 可能已有新域名，先读取当前进程再检查外网连接。
     if svc_running "$SVC_ARGO" "$SVC_ARGO"; then
         d=$(get_domain 9>&-)
@@ -1638,6 +2123,7 @@ agent_check() {
         fi
     fi
     if remote_probe_once; then
+        location_refresh
         # 连接正常时仅补发已知变化，不重复上传相同节点。
         if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_node || true; fi
         return 0
@@ -1658,6 +2144,7 @@ agent_check() {
         return 1
     fi
     [ "${STOP:-0}" != 1 ] || return 1
+    location_refresh
     # 新域名取得后立即同步，不再对新域名重复执行外网探测。
     if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then
         if ! report_node; then
@@ -1683,6 +2170,7 @@ agent_once() {
     if [ "$rc" = 10 ]; then trap - TERM INT; return 0
     elif [ "$rc" != 0 ]; then trap - TERM INT; return "$rc"; fi
     agent_state_load
+    resource_maintenance "$(date +%s)"
     if agent_startup; then
         agent_check "$(date +%s)"; rc=$?
         agent_state_save
@@ -1697,16 +2185,19 @@ agent_loop_body() {
     local now
     WATCH_EMPTY_WARNED=0
     agent_state_load
+    RESOURCE_LAST_MAINTENANCE_TS=0
+    resource_maintenance "$(date +%s)"
     agent_startup || return 1
     agent_log INFO "CF 连接检查启动: 每 ${CHECK_INTERVAL}s 检查，失败立即重建并上报新域名"
     while [ "$STOP" != 1 ]; do
         now=$(date +%s)
+        resource_maintenance "$now"
         if [ "$((now-LAST_CHECK_TS))" -ge "$CHECK_INTERVAL" ]; then
             agent_check "$now"
         elif [ "$WATCH_INTERVAL" -gt 0 ] && [ "$((now-LAST_WATCH_TS))" -ge "$WATCH_INTERVAL" ]; then
             agent_watch "$now"
         fi
-        agent_state_save
+        agent_state_save "$now" || agent_log WARN "守护状态保存失败，将稍后重试: $AGENT_STATE"
         agent_sleep 5 || break
     done
     agent_log INFO "守护停止"
@@ -1854,7 +2345,8 @@ show_node() {
     if [ -s "$AGENT_ENV" ]; then
         agent_load
         printf '模式: %s\n域名: %s\n本地端口: 127.0.0.1:%s\nUUID: %s\n路径: %s\n' "$MODE" "$DOMAIN" "$PORT" "$UUID" "$WS_PATH"
-        if [ -n "$DOMAIN" ]; then printf '节点链接:\n%s\n' "$(vmess_link "$DOMAIN" "$UUID" "$WS_PATH" "${CFIP:-$DOMAIN}" "$NODE_NAME")"; fi
+        [ -z "$COUNTRY" ] || printf '国家/地区: %s\n' "$(node_display_name)"
+        if [ -n "$DOMAIN" ]; then printf '节点链接:\n%s\n' "$(vmess_link "$DOMAIN" "$UUID" "$WS_PATH" "${CFIP:-$DOMAIN}" "$(node_display_name)")"; fi
     elif [ -f "$NODE_DIR/quick.txt" ]; then cat "$NODE_DIR/quick.txt"
     elif [ -f "$NODE_DIR/fixed.txt" ]; then cat "$NODE_DIR/fixed.txt"
     else echo "尚未安装任何节点"; fi
