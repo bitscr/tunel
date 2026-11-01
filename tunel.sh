@@ -184,6 +184,7 @@ install_paths_preflight() {
 }
 
 setup_paths
+SELF_INSTALL_DONE=0
 SVC_SB="cf-tunel-singbox"
 SVC_ARGO="cf-tunel-argo"
 SVC_AGENT="cf-tunel-agent"
@@ -886,14 +887,17 @@ install_self() {
     if [ -f "$source" ] && [ -r "$source" ]; then
         # 老版 bin/tunel 仍是脚本，先复制到 work 再替换为绑定目录的启动器。
         if [ "$source" -ef "$SELF_SCRIPT" ]; then chmod 755 "$SELF_SCRIPT" || return 3
-        else install_bin "$source" "$SELF_SCRIPT" || return 3; fi
+        else
+            # 守护可能仍在读取旧脚本，原子替换避免更新时截断其正在执行的文件。
+            tmp=$(mktemp "$WORK_DIR/tunel-script.XXXXXX") || return 3
+            if ! install_bin "$source" "$tmp" || ! mv -f "$tmp" "$SELF_SCRIPT"; then rm -f "$tmp"; return 3; fi
+        fi
     else
         tmp=$(mktemp "$WORK_DIR/tunel-download.XXXXXX") || return 3
         if ! http_fetch "$VENDOR_RAW_BASE/tunel.sh" "$tmp" 524288 || [ ! -s "$tmp" ] || ! bash -n "$tmp"; then
             rm -f "$tmp"; echo "错误: 无法下载可用脚本到 $SELF_SCRIPT" >&2; return 3
         fi
-        install_bin "$tmp" "$SELF_SCRIPT" || { rm -f "$tmp"; return 3; }
-        rm -f "$tmp"
+        chmod 755 "$tmp" && mv -f "$tmp" "$SELF_SCRIPT" || { rm -f "$tmp"; return 3; }
     fi
     # 固定目录的启动器让自定义路径在直接调用和 daemon 重启中都保持一致。
     tmp=$(mktemp "$BIN_DIR/tunel-launcher.XXXXXX") || return 3
@@ -903,7 +907,10 @@ install_self() {
         else printf "export TUNEL_HOME='%s'\n" "$TUNEL_HOME"; fi
         printf "exec bash '%s' \"\$@\"\n" "$SELF_SCRIPT"
     } > "$tmp"
-    chmod 755 "$tmp" && mv -f "$tmp" "$SELF_INSTALL" && return 0
+    if chmod 755 "$tmp" && mv -f "$tmp" "$SELF_INSTALL"; then
+        SELF_INSTALL_DONE=1
+        return 0
+    fi
     rm -f "$tmp"; echo "错误: 无法将启动器安装到 $SELF_INSTALL" >&2; return 3
 }
 
@@ -1051,16 +1058,17 @@ svc_env_lines() {
     if [ "$ENV_LOWMEM" = 1 ]; then printf 'Environment=GOGC=30\nEnvironment=GOMEMLIMIT=48MiB\n'; fi
 }
 
-# 六七参数让 agent 有始终重启和网络依赖，两种核心仍使用 on-failure。
+# 六七参数配置重启和网络依赖，第八参数允许更新自启配置而保留运行中的核心。
 svc_install() {
-    local unit=$1 oname=$2 desc=$3 cmd=$4 logdir=$5 policy=${6:-on-failure} after=${7:-network.target nss-lookup.target}
-    local envsh="" wants="" delay=10
+    local unit=$1 oname=$2 desc=$3 cmd=$4 logdir=$5 policy=${6:-on-failure} after=${7:-network-online.target nss-lookup.target} action=${8:-restart}
+    local envsh="" wants="Wants=network-online.target" delay=10
+    case "$action" in start|restart) : ;; *) return 2 ;; esac
     runtime_dirs_ensure || return 1
     mkdir -p -m 700 "$logdir" || return 1
     chmod 700 "$logdir"
     svc_wrapper "$oname" "$cmd" || return 1
     [ "$ENV_LOWMEM" != 1 ] || envsh=$(printf 'export GOGC=30\nexport GOMEMLIMIT=48MiB')
-    if [ "$policy" = always ]; then wants="Wants=network-online.target"; delay=15; fi
+    if [ "$policy" = always ]; then wants="Wants=network-online.target $SVC_SB.service $SVC_ARGO.service"; delay=15; fi
     case "$ENV_INIT" in
         systemd)
             [ "$TUNEL_SYSTEM" = 1 ] && [ "$EUID" = 0 ] || return 1
@@ -1070,6 +1078,7 @@ svc_install() {
 Description=$desc
 After=$after
 $wants
+StartLimitIntervalSec=0
 [Service]
 Type=simple
 User=root
@@ -1083,7 +1092,7 @@ $(svc_env_lines)
 [Install]
 WantedBy=multi-user.target
 EOF
-            systemctl daemon-reload && systemctl enable "$unit" >/dev/null 2>&1 && systemctl restart "$unit" 9>&- ;;
+            systemctl daemon-reload && systemctl enable "$unit" >/dev/null 2>&1 && systemctl "$action" "$unit" 9>&- ;;
         openrc)
             [ "$TUNEL_SYSTEM" = 1 ] && [ "$EUID" = 0 ] || return 1
             # 新 openrc 由 supervisor 拉起崩溃进程，旧版保留 background 兼容。
@@ -1108,10 +1117,10 @@ depend() {
     after net
 }
 EOF
-            chmod 755 "/etc/init.d/$oname" && rc-update add "$oname" default >/dev/null 2>&1 && rc-service "$oname" restart 9>&- ;;
+            chmod 755 "/etc/init.d/$oname" && rc-update add "$oname" default >/dev/null 2>&1 && rc-service "$oname" "$action" 9>&- ;;
         none)
             # 容器没有 init 时使用同一包装脚本，控制脚本保存 PID。
-            svc_none_install "$oname" "$logdir" ;;
+            svc_none_install "$oname" "$logdir" "$action" ;;
     esac
     local rc=$?
     if [ "$rc" != 0 ]; then
@@ -1456,14 +1465,14 @@ nodes_refresh() {
 sb_service_up() {
     local output="$LOG_DIR/access.log" error="$LOG_DIR/error.log"
     [ "${CORE_LOGS:-1}" = 1 ] || { output=/dev/null; error=/dev/null; }
-    svc_install "$SVC_SB" "$SVC_SB" "tunel VMess-WS" "\"$SB_BIN\" run -c \"$SB_CFG\" >> \"$output\" 2>> \"$error\"" "$LOG_DIR" on-failure
+    svc_install "$SVC_SB" "$SVC_SB" "tunel VMess-WS" "\"$SB_BIN\" run -c \"$SB_CFG\" >> \"$output\" 2>> \"$error\"" "$LOG_DIR" on-failure "network-online.target nss-lookup.target" "${1:-restart}"
 }
 
 # shell -c 中 exec 让 cloudflared 成为直接受监管的进程。
 argo_service_up() {
     local output=$ARGO_LOG
     [ "${CORE_LOGS:-1}" = 1 ] || output=/dev/null
-    svc_install "$SVC_ARGO" "$SVC_ARGO" "tunel (cloudflared)" "/bin/sh -c 'exec \"$CF_BIN\" $2 >> \"$output\" 2>&1'" "$LOG_DIR" on-failure
+    svc_install "$SVC_ARGO" "$SVC_ARGO" "tunel (cloudflared)" "/bin/sh -c 'exec \"$CF_BIN\" $2 >> \"$output\" 2>&1'" "$LOG_DIR" on-failure "network-online.target nss-lookup.target" "${3:-restart}"
 }
 
 # 读取已保存的固定凭据，恢复时无需用户重新输入密钥。
@@ -1485,7 +1494,7 @@ argo_wrapper_refresh() {
 argo_service_configure() {
     local args
     args=$(argo_service_args) || return 1
-    argo_service_up "$MODE" "$args"
+    argo_service_up "$MODE" "$args" "${1:-restart}"
 }
 
 LOG_MAX_BYTES=262144
@@ -2204,7 +2213,10 @@ agent_check() {
     if [ "$ok" = 1 ]; then
         location_refresh
         # 连接正常时仅补发已知变化，不重复上传相同节点。
-        if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_node || true; fi
+        if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ] && ! report_node; then
+            LAST_CHECK_TS=$(($(date +%s)-CHECK_INTERVAL+600))
+            agent_log WARN "连接已恢复，但上报失败，600s 后重新检查并补发"
+        fi
         return 0
     fi
     [ "${STOP:-0}" != 1 ] || return 1
@@ -2229,7 +2241,8 @@ agent_check() {
     # 新域名取得后立即同步，不再对新域名重复执行外网探测。
     if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then
         if ! report_node; then
-            agent_log WARN "新域名已取得，但上报失败，保留待补发状态"
+            LAST_CHECK_TS=$(($(date +%s)-CHECK_INTERVAL+600))
+            agent_log WARN "新域名已取得，但上报失败，600s 后重新检查并补发"
         fi
     fi
     return 0
@@ -2269,6 +2282,9 @@ agent_loop_body() {
     RESOURCE_LAST_MAINTENANCE_TS=0
     resource_maintenance "$(date +%s)"
     agent_startup || return 1
+    # 每次启动都检查当前连接，开机网络未就绪不能沿用上次运行的两小时等待。
+    agent_log INFO "守护启动，立即检查当前连接并同步域名"
+    agent_check "$(date +%s)"
     agent_log INFO "CF 连接检查启动: 每 ${CHECK_INTERVAL}s 检查，连续 3 次失败后重建，重建失败 600s 后重试"
     while [ "$STOP" != 1 ]; do
         now=$(date +%s)
@@ -2384,25 +2400,21 @@ run_foreground() {
     return "$rc"
 }
 
-# 服务首次配置或从旧 quick 升级时重写 metrics 参数，已有服务 start 不更换域名。
+# 更新落地脚本和三个服务的自启配置，start 保留已运行核心；metrics 变化才替换隧道。
 agent_start() {
-    local oldmp rc
+    local oldmp
     dependencies_ensure || return 3
     agent_env_ensure || return 1
-    [ -x "$SELF_INSTALL" ] || install_self || return 3
+    [ "$SELF_INSTALL_DONE" = 1 ] || install_self || return 3
     [ -n "$MODE" ] || { echo "错误: 请先安装隧道" >&2; return 1; }
     oldmp=$MP
     metrics_port_ensure || return $?
-    argo_wrapper_refresh || return 1
     if [ -z "$oldmp" ] || [ "$oldmp" != "$MP" ]; then
         # 旧服务没 metrics 或端口失效，需要一次受控替换；只有域名变化才会上报。
-        svc_stop "$SVC_ARGO" "$SVC_ARGO"
-        sb_service_up && argo_service_configure || return 1
+        svc_stop "$SVC_ARGO" "$SVC_ARGO" || return 1
     fi
+    sb_service_up start && argo_service_configure start || return 1
     if [ "$ENV_INIT" = none ]; then
-        # @reboot 先启动依赖，再启动守护，不能指望 nohup 自动跨重启保留进程。
-        "$BIN_DIR/$SVC_SB-ctl" start 9>&- >/dev/null 2>&1 || sb_service_up || return 1
-        "$BIN_DIR/$SVC_ARGO-ctl" start 9>&- >/dev/null 2>&1 || argo_service_configure || return 1
         boot_hook_install || return 1
     fi
     svc_install "$SVC_AGENT" "$SVC_AGENT" "tunel agent (self-check / report)" "\"$SELF_INSTALL\" agent loop" "$LOG_DIR" always "network-online.target $SVC_SB.service $SVC_ARGO.service"

@@ -82,6 +82,8 @@ curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh \
 
 root 默认使用 `/etc/cf-tunel`、`/usr/local/bin/tunel` 和 `/var/log/cf-tunel`。系统目录不可写时，安装会自动退到 `$HOME/.local/share/tunel` 并显示实际路径；普通用户默认使用该用户目录。
 
+默认系统安装会为 sing-box、cloudflared 和守护配置开机自启。systemd 等待 network-online；网络晚到时由守护继续恢复。使用 `--no-agent` 时不启用守护自启，便携与容器沿用各自的启动方式。
+
 显式设置 `TUNEL_HOME` 可选择便携目录，出错时会报错；它必须是专用、可写的 ASCII 绝对路径，不能含空格、引号、特殊字符或 `.` / `..` 路径段。新安装不会自动迁移旧安装。
 
 系统安装使用 `tunel` 命令；用户安装使用 `"$HOME/.local/share/tunel/bin/tunel"`，自定义目录使用其 `bin/tunel`。后续按安装时显示的路径管理。
@@ -139,13 +141,29 @@ stop_grace_period: 45s
 
 config 支持 REPORT_URL、REPORT_TOKEN、NODE_NAME、CFIP、CHECK_INTERVAL、WATCH_INTERVAL。已有安装可用 `tunel config CHECK_INTERVAL=7200 WATCH_INTERVAL=7200` 更新周期；重新 quick / fixed 安装时，未显式指定的周期恢复默认值。
 
+### 更新已有安装
+
+root 默认系统安装执行：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh | bash -s -- agent start
+```
+
+用户或便携安装须沿用原 TUNEL_HOME；默认用户目录例如：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh | TUNEL_HOME="$HOME/.local/share/tunel" bash -s -- agent start
+```
+
+自定义目录将示例路径换成原目录。更新会刷新本地脚本和相应的服务自启配置，保留既有 UUID、端口、路径与上报配置，无需重新填写上报 token；更新后的守护立即检查，连接失效时按恢复策略重建。
+
 ## 日常使用
 
 在 `/ui` 的「记录」查看节点，「数据源」保存手工链接或远程订阅，「访问链接」复制通用、Clash、sing-box、Surge、Quantumult X 或 Loon 订阅。订阅支持 GET / HEAD；保存后刷新订阅，跨区传播仍可能短暂延迟。
 
 设置页 CFIP 支持换行或逗号分隔的 IP / 域名及可选端口，默认端口 443；指定 IPv6 端口时使用 `[IPv6]:端口`。保存空 CFIP 会关闭自定义连接地址，不再回退环境变量；CFIP 不改变国家地区名称。
 
-默认每 2 小时检查连接，每轮最多探测 3 次，失败探测之间间隔 10 秒；持续失败时重建隧道，重建失败后约 10 分钟重试。域名同步默认也为 2 小时，临时隧道换域名后会同步到订阅。
+每次守护启动立即检查连接，每轮最多探测 3 次，失败探测之间间隔 10 秒，连续 3 次失败才重建隧道。重建失败后约 10 分钟重试；上报失败也会在约 10 分钟后重新检查并补发。恢复后按默认 2 小时周期检查，域名同步默认也为 2 小时，临时隧道换域名后会同步到订阅。
 
 Worker 不判断服务器是否在线，也不会自动删除离线记录。Quick Tunnel 没有可用性保证，长期使用建议固定隧道。
 
