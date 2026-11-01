@@ -1,4 +1,4 @@
-const VERSION = '2.0.0';
+const VERSION = '0.0.1';
 const DEFAULT_SUBAPI = 'https://clawsub.7979.pp.ua';
 const DEFAULT_SUBCONFIG = 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/config/ACL4SSR_Online_Mini_MultiMode.ini';
 const SECURITY_HEADERS = Object.freeze({ 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' });
@@ -359,12 +359,16 @@ function renameVmessLink(link, name) {
   }
 }
 
+function quickHostValid(host) {
+  return typeof host === 'string' && /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.trycloudflare\.com$/i.test(host) && !/^(?:api|www)\.trycloudflare\.com$/i.test(host);
+}
+
 function validateReport(payload) {
   validateId(payload.id);
   const checks = [
     ['name', typeof payload.name === 'string' && Array.from(payload.name).length <= 64],
     ['mode', payload.mode === 'quick' || payload.mode === 'fixed'],
-    ['host', typeof payload.host === 'string' && /^[A-Za-z0-9.-]{1,253}$/.test(payload.host)],
+    ['host', typeof payload.host === 'string' && /^[A-Za-z0-9.-]{1,253}$/.test(payload.host) && (payload.mode !== 'quick' || quickHostValid(payload.host))],
     ['path', typeof payload.path === 'string' && payload.path.startsWith('/') && payload.path.length <= 128],
     ['uuid', typeof payload.uuid === 'string' && /^[0-9a-fA-F-]{36}$/.test(payload.uuid)],
     ['link', typeof payload.link === 'string' && payload.link.startsWith('vmess://') && payload.link.length <= 2048],
@@ -392,7 +396,7 @@ function validateReport(payload) {
   return { ...payload, port, addr };
 }
 
-async function reportNode(request, config, now) {
+async function reportNode(request, config, now, cache, origin) {
   const payload = validateReport(await readJson(request, 8192));
   const key = `node:${payload.id}`;
   const old = await config.kv.get(key, 'json');
@@ -413,6 +417,7 @@ async function reportNode(request, config, now) {
     return json({ ok: true, id: payload.id, skipped: true });
   }
   await config.kv.put(key, JSON.stringify({ ...next, firstSeen: old?.firstSeen ?? now, lastReport: now }));
+  await purgeCache(cache, origin, config);
   return json({ ok: true, id: payload.id });
 }
 
@@ -477,7 +482,7 @@ function sourceValues(value, field) {
   return values;
 }
 
-async function saveSources(request, config, now) {
+async function saveSources(request, config, now, cache, origin) {
   const payload = await readJson(request, 65536);
   const links = sourceValues(payload.links, 'links');
   const upstream = sourceValues(payload.upstream, 'upstream');
@@ -489,6 +494,7 @@ async function saveSources(request, config, now) {
   const changed = !old || JSON.stringify(old.links ?? []) !== JSON.stringify(links) || JSON.stringify(old.upstream ?? []) !== JSON.stringify(upstream);
   if (changed) {
     await config.kv.put('sources', JSON.stringify(next));
+    await purgeCache(cache, origin, config);
   }
   return json({ links, upstream: upstream.length ? upstream : config.initialUpstream, updatedAt: changed ? now : old.updatedAt ?? 0 });
 }
@@ -620,6 +626,18 @@ async function storeResponse(cache, key, body, headers = {}) {
   }
   try {
     await cache.put(new Request(key), plain(body, 200, { 'Cache-Control': 'public, max-age=60', ...headers }));
+  } catch {
+  }
+}
+
+async function purgeCache(cache, origin, config) {
+  if (!cache) {
+    return;
+  }
+  try {
+    const { cfipCacheTag } = await effectiveConfig(config);
+    const keys = [`${origin}/raw?cfip=${cfipCacheTag}`, ...['base64', 'clash', 'singbox', 'surge', 'quanx', 'loon'].map(format => `${origin}/sub?fmt=${format}&cfip=${cfipCacheTag}`)];
+    await Promise.allSettled(keys.map(key => cache.delete(new Request(key))));
   } catch {
   }
 }
@@ -836,7 +854,7 @@ function renderNodes(data) {
   const table = document.createElement('table');
   const head = document.createElement('thead');
   const header = document.createElement('tr');
-  for (const label of ['名称', '国家/地区', '模式', '主机', '连接地址', '更新时间', '操作']) {
+  for (const label of ['名称', '国家/地区', '模式', '主机', '连接地址', '最后上报', '操作']) {
     const th = document.createElement('th'); th.textContent = label; header.appendChild(th);
   }
   head.appendChild(header); table.appendChild(head);
@@ -856,7 +874,7 @@ function renderNodes(data) {
     deleteButton.addEventListener('click', async () => {
       if (!confirm('确认删除记录「' + (node.name || node.id) + '」？')) { return; }
       deleteButton.disabled = true;
-      try { await api('/api/node?id=' + encodeURIComponent(node.id), { method: 'DELETE' }); notify('记录已删除，访问链接约 60 秒内更新'); await refresh(); }
+      try { await api('/api/node?id=' + encodeURIComponent(node.id), { method: 'DELETE' }); notify('记录已删除，订阅同步可能稍有延迟'); await refresh(); }
       catch (error) { notify(error.message, true); }
       finally { deleteButton.disabled = false; }
     });
@@ -908,16 +926,18 @@ async function refresh() {
       document.getElementById('save-cfip').disabled = false;
       throw failure;
     });
-    const results = await Promise.allSettled([settingsRequest, api('/api/nodes'), api('/api/sources'), api('/api/status')]);
+    const results = await Promise.allSettled([settingsRequest, api('/api/nodes'), api('/api/sources'), api('/api/status?counts=0')]);
     const [, nodes, sources, status] = results;
-    if (nodes.status === 'fulfilled') { renderNodes(nodes.value); }
+    if (nodes.status === 'fulfilled') {
+      renderNodes(nodes.value);
+      document.getElementById('node-count').textContent = nodes.value.nodes.length;
+    }
     if (sources.status === 'fulfilled') {
       document.getElementById('links').value = sources.value.links.join('\n');
       document.getElementById('upstream').value = sources.value.upstream.join('\n');
+      document.getElementById('source-count').textContent = sources.value.links.length + sources.value.upstream.length;
     }
     if (status.status === 'fulfilled') {
-      document.getElementById('node-count').textContent = status.value.nodeCount;
-      document.getElementById('source-count').textContent = status.value.sourceCount;
       try { document.getElementById('backend').textContent = new URL(status.value.subapi).host; }
       catch { document.getElementById('backend').textContent = status.value.subapi; }
       renderSettings(status.value);
@@ -965,7 +985,7 @@ document.getElementById('save-sources').addEventListener('click', async event =>
     const sources = await api('/api/sources', { method: 'PUT', body: JSON.stringify({ links: document.getElementById('links').value.split(/\r?\n/), upstream: document.getElementById('upstream').value.split(/\r?\n/) }) });
     document.getElementById('links').value = sources.links.join('\n'); document.getElementById('upstream').value = sources.upstream.join('\n');
     document.getElementById('source-count').textContent = sources.links.length + sources.upstream.length;
-    notify('已保存，访问链接约 60 秒内更新');
+    notify('已保存，订阅同步可能稍有延迟');
   } catch (error) { notify(error.message, true); }
   finally { button.disabled = false; }
 });
@@ -1040,25 +1060,29 @@ async function handleRequest(request, env) {
       throw new HttpError(401, '写入鉴权失败');
     }
     if (path === '/api/report') {
-      return await reportNode(request, config, now);
+      return await reportNode(request, config, now, cache, url.origin);
     }
     const payload = await readJson(request, 8192);
     await config.kv.delete(`node:${validateId(payload.id)}`);
+    await purgeCache(cache, url.origin, config);
     return json({ ok: true });
   }
   if (path === '/raw') {
-    requireMethod(request, ['GET']);
+    requireMethod(request, ['GET', 'HEAD']);
     if (!await authorizeRaw(url.searchParams.get('t') ?? '', config, timestamp)) {
       throw new HttpError(401, '只读鉴权失败');
     }
     return plain(await rawContent(await effectiveConfig(config), url.origin, cache), 200, { 'Cache-Control': 'no-store' });
   }
-  const adminMethods = { '/api/nodes': ['GET'], '/api/node': ['DELETE'], '/api/sources': ['GET', 'PUT'], '/api/settings': ['GET', 'PUT'], '/api/status': ['GET'], '/sub': ['GET'] };
+  const adminMethods = { '/api/nodes': ['GET'], '/api/node': ['DELETE'], '/api/sources': ['GET', 'PUT'], '/api/settings': ['GET', 'PUT'], '/api/status': ['GET'], '/sub': ['GET', 'HEAD'] };
   if (!Object.hasOwn(adminMethods, path)) {
     return plain('not found', 404, { 'Cache-Control': 'no-store' });
   }
   requireMethod(request, adminMethods[path]);
   if (!route.adminCredential) {
+    if (path === '/sub') {
+      return plain('not found', 404, { 'Cache-Control': 'no-store' });
+    }
     throw new HttpError(401, '管理鉴权失败');
   }
   if (path === '/api/settings') {
@@ -1072,33 +1096,42 @@ async function handleRequest(request, env) {
   }
   if (path === '/api/node') {
     await config.kv.delete(`node:${validateId(url.searchParams.get('id'))}`);
+    await purgeCache(cache, url.origin, config);
     return json({ ok: true });
   }
   if (path === '/api/sources') {
     if (request.method === 'GET') {
       return json(await readSources(config));
     }
-    return await saveSources(request, config, now);
+    return await saveSources(request, config, now, cache, url.origin);
   }
   if (path === '/api/status') {
     const settings = await readSettings(config);
     const cfip = settings.valid ? parseCfip(settings.cfip).map(address => address.label) : [];
-    const nodes = await readNodes(config.kv);
-    const sources = await readSources(config);
-    return json({ version: VERSION, subapi: config.subapi, subconfig: config.subconfig, cfip, nodeCount: nodes.length, sourceCount: sources.links.length + sources.upstream.length, ...(!settings.valid ? { cfipValidationError: settings.validationError } : {}) });
+    const includeCounts = url.searchParams.get('counts') !== '0';
+    const nodeCount = includeCounts ? (await listNodeKeys(config.kv)).length : undefined;
+    const sources = includeCounts ? await readSources(config) : undefined;
+    return json({ version: VERSION, subapi: config.subapi, subconfig: config.subconfig, cfip, ...(includeCounts ? { nodeCount, sourceCount: sources.links.length + sources.upstream.length } : {}), ...(!settings.valid ? { cfipValidationError: settings.validationError } : {}) });
   }
   return await subscription(request, url, await effectiveConfig(config), timestamp, cache);
 }
 
 export default {
   async fetch(request, env) {
+    let response;
     try {
-      return await handleRequest(request, env);
+      response = await handleRequest(request, env);
     } catch (error) {
       if (error instanceof HttpError) {
-        return json({ error: error.message }, error.status, error.headers);
+        response = json({ error: error.message }, error.status, error.headers);
+      } else {
+        response = json({ error: '内部错误' }, 500);
       }
-      return json({ error: '内部错误' }, 500);
     }
+    if (request.method === 'HEAD') {
+      await response.body?.cancel().catch(() => {});
+      return new Response(null, { status: response.status, statusText: response.statusText, headers: response.headers });
+    }
+    return response;
   },
 };

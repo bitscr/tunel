@@ -41,7 +41,7 @@ esac
 # ============================================================================
 # 版本固化：只从本仓库 vendor 下载，sha256 必须与 vendor/SHA256SUMS 一致
 # ============================================================================
-TUNEL_VERSION="2.0.0"
+TUNEL_VERSION="0.0.1"
 DEFAULT_CHECK_INTERVAL=7200
 LOCATION_MEMORY_ATTEMPT_TS=0
 VENDOR_CF_TAG="2026.10.7"
@@ -830,6 +830,10 @@ agent_load() {
         LOCATION_IP=""; LOCATION_INTERFACE=""; LOCATION_METHOD=""
     fi
     LAST_REPORTED_DOMAIN=$(env_get "$AGENT_ENV" LAST_REPORTED_DOMAIN)
+    if [ "$MODE" = quick ]; then
+        quick_domain_valid "$DOMAIN" || DOMAIN=""
+        quick_domain_valid "$LAST_REPORTED_DOMAIN" || LAST_REPORTED_DOMAIN=""
+    fi
 }
 
 # 补齐默认字段，并从旧 nodes 文件迁移，保留已安装机器的目录约定。
@@ -858,6 +862,21 @@ agent_env_ensure() {
     done
     chmod 600 "$AGENT_ENV"
     agent_load
+    if [ "$MODE" = quick ]; then
+        value=$(env_get "$AGENT_ENV" DOMAIN)
+        if [ -n "$value" ] && ! quick_domain_valid "$value"; then
+            env_set "$AGENT_ENV" DOMAIN "" && env_set "$AGENT_ENV" LAST_REPORTED_DOMAIN "" || return 1
+            DOMAIN=""; LAST_REPORTED_DOMAIN=""
+            rm -f "$NODE_DIR/quick.env" "$NODE_DIR/quick.txt"
+            agent_log WARN "已清理无效临时隧道域名，等待当前 cloudflared 分配真实域名"
+        fi
+        value=$(env_get "$AGENT_ENV" LAST_REPORTED_DOMAIN)
+        if [ -n "$value" ] && ! quick_domain_valid "$value"; then
+            env_set "$AGENT_ENV" LAST_REPORTED_DOMAIN "" || return 1
+            LAST_REPORTED_DOMAIN=""
+        fi
+    fi
+    return 0
 }
 
 # 无论本地脚本还是 curl 管道安装，服务都能调用稳定的脚本路径。
@@ -959,8 +978,8 @@ parse_args() {
 
 # 帮助只读且不探测网络，适用于无 tty 的脚本调用。
 help() {
+    printf 'tunel %s — vmess-ws 隧道与自动上报\n' "$TUNEL_VERSION"
     cat <<'EOF'
-tunel 2.0.0 — vmess-ws 隧道与自动上报
 用法: tunel.sh <子命令> [选项]
   menu                    交互菜单
   quick [选项]            安装临时隧道
@@ -990,6 +1009,8 @@ EOF
 
 # 服务包装只写路径和参数，敏感 token 始终从 600 文件读取。
 svc_wrapper() {
+    local tmp
+    tmp=$(mktemp "$BIN_DIR/$1-run.XXXXXX") || return 1
     {
         printf '#!/bin/sh\n'
         if [ "$TUNEL_SYSTEM" = 1 ]; then printf 'unset TUNEL_HOME\n'
@@ -1004,6 +1025,8 @@ case "$tunel_fd_limit" in
     *) [ "$tunel_fd_limit" -le 4096 ] || ulimit -Sn 4096 2>/dev/null || true ;;
 esac
 EOF
+        # 每次实际启动都清空旧隧道日志，覆盖服务管理器的自动重启。
+        if [ "$1" = "$SVC_ARGO" ]; then printf ': > "%s" || exit 1\n' "$ARGO_LOG"; fi
         # exec 让服务管理器直接追踪实际子进程。
         if [ "$1" != "$SVC_AGENT" ] && [ "${CORE_LOGS:-1}" != 1 ]; then
             # 显式禁用守护后无人限量日志，核心输出直接丢弃以免长期占盘。
@@ -1011,8 +1034,10 @@ EOF
         else
             printf 'exec %s\n' "$2"
         fi
-    } > "$BIN_DIR/$1-run"
-    chmod 755 "$BIN_DIR/$1-run"
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+    if chmod 755 "$tmp" && mv -f "$tmp" "$BIN_DIR/$1-run"; then return 0; fi
+    rm -f "$tmp"
+    return 1
 }
 
 # /proc starttime 与 PID 一起持久化，避免 stale PID 杀到重用该号码的其他进程。
@@ -1270,7 +1295,7 @@ metrics_port_ensure() {
 }
 
 # 三种启动方式都启用本机 metrics，域名获取无需依赖横幅格式。
-argo_quick_args() { printf 'tunnel --no-autoupdate --loglevel warn --edge-ip-version auto --protocol http2 --metrics 127.0.0.1:%s --url http://127.0.0.1:%s' "$MP" "$1"; }
+argo_quick_args() { printf 'tunnel --no-autoupdate --loglevel info --edge-ip-version auto --protocol http2 --metrics 127.0.0.1:%s --url http://127.0.0.1:%s' "$MP" "$1"; }
 
 # token 值从文件读取，不进入 unit、wrapper 或 cloudflared 的进程参数。
 argo_token_args() { printf 'tunnel --no-autoupdate --loglevel warn --edge-ip-version auto --protocol http2 --metrics 127.0.0.1:%s run --token-file "%s"' "$MP" "$ARGO_TOKEN_FILE"; }
@@ -1296,12 +1321,33 @@ EOF
     chmod 600 "$TUNNEL_JSON" "$TUNNEL_YML"
 }
 
-# 只有 metrics 暂不可用才读取当前进程日志，重启前必须清空旧日志。
+# 临时隧道只接受单个合法 DNS 标签，排除服务接口地址。
+quick_domain_valid() {
+    local LC_ALL=C label
+    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.[Tt][Rr][Yy][Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee]\.[Cc][Oo][Mm]$ ]] || return 1
+    label=${1%%.*}
+    case "$label" in [aA][pP][iI]|[wW][wW][wW]) return 1 ;; esac
+    return 0
+}
+
+# metrics 暂不可用时仅接受创建成功横幅中的完整 URL，不抓请求或错误 URL。
 argo_grab_domain() {
     local log=$1 tries=${2:-10} d i
     for ((i=0; i<tries; i++)); do
-        d=$(sed -n 's|.*https://\([A-Za-z0-9-]*\.trycloudflare\.com\).*|\1|p' "$log" 2>/dev/null | tail -1)
-        if [ -n "$d" ]; then printf '%s' "$d"; return 0; fi
+        d=$(awk '
+            /Requesting new quick Tunnel|[Ff]ailed to request quick [Tt]unnel|api[.]trycloudflare[.]com/ {host="";remaining=0;next}
+            /Your quick Tunnel has been created/ {host="";remaining=8;next}
+            remaining>0 {
+                remaining--
+                if (match($0, /[|][[:space:]]*https:\/\/[A-Za-z0-9-]+\.trycloudflare\.com[[:space:]]*[|][[:space:]]*$/)) {
+                    host=substr($0,RSTART,RLENGTH)
+                    sub(/^[|][[:space:]]*https:\/\//,"",host)
+                    sub(/[[:space:]]*[|][[:space:]]*$/,"",host)
+                    remaining=0
+                }
+            }
+            END {if(host!="")printf "%s",host}' "$log" 2>/dev/null)
+        if quick_domain_valid "$d"; then printf '%s' "$d"; return 0; fi
         [ "$i" -ge "$((tries-1))" ] || sleep 2
     done
     return 1
@@ -1309,13 +1355,20 @@ argo_grab_domain() {
 
 # 本地接口不出网，只接受合法 quick tunnel 域名避免污染链接与 shell 参数。
 domain_from_metrics() {
-    local d
-    d=$(exec 9>&-; curl -fsS -m 3 "http://127.0.0.1:$MP/quicktunnel" 9>&- 2>/dev/null | sed -n 's/.*"hostname"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    [[ "$d" =~ ^[A-Za-z0-9.-]+\.trycloudflare\.com$ ]] && printf '%s' "$d"
+    local d response rc LC_ALL=C
+    valid_port "$MP" || return 1
+    response=$(
+        exec 7>&- 9>&-
+        set -o pipefail
+        curl -q -fsS --proxy '' --noproxy '*' --connect-timeout 1 -m 3 --max-filesize 4096 "http://127.0.0.1:$MP/quicktunnel" 2>/dev/null | head -c 4097
+    ); rc=$?
+    [ "$rc" = 0 ] && [ "${#response}" -le 4096 ] || return 1
+    d=$(printf '%s' "$response" | location_json_string hostname) || return 1
+    quick_domain_valid "$d" && printf '%s' "$d"
 }
 
 # HTTP 200 表示 cloudflared 有边缘连接，其他状态均视为未就绪。
-edge_ready() { [ "$(exec 9>&-; curl -s -o /dev/null -w '%{http_code}' -m 3 "http://127.0.0.1:$MP/ready" 9>&- 2>/dev/null)" = 200 ]; }
+edge_ready() { [ "$(exec 7>&- 9>&-; curl -q -s --proxy '' --noproxy '*' --connect-timeout 1 -o /dev/null -w '%{http_code}' -m 3 "http://127.0.0.1:$MP/ready" 2>/dev/null)" = 200 ]; }
 
 # 固定域名无需查询 quicktunnel；quick 优先从本机当前进程获取。
 get_domain() {
@@ -1323,7 +1376,7 @@ get_domain() {
     if [ "$MODE" = fixed ]; then env_get "$AGENT_ENV" DOMAIN; return; fi
     d=$(domain_from_metrics 9>&-)
     [ -n "$d" ] || d=$(argo_grab_domain "$ARGO_LOG" 1)
-    printf '%s' "$d"
+    quick_domain_valid "$d" && printf '%s' "$d"
 }
 
 # 等待新域名有明确上限，固定隧道使用空旧值等待当前域名即可。
@@ -1332,6 +1385,7 @@ wait_new_domain() {
     WAIT_DOMAIN=""
     while [ "$elapsed" -le "$timeout" ] && [ "${STOP:-0}" != 1 ]; do
         d=$(get_domain 9>&-)
+        if [ "$MODE" = quick ] && ! quick_domain_valid "$d"; then d=""; fi
         if [ -n "$d" ] && [ "$d" != "$old" ]; then WAIT_DOMAIN=$d; printf '%s' "$d"; return 0; fi
         [ "$elapsed" -lt "$timeout" ] || break
         agent_sleep 2 || return 1; elapsed=$((elapsed+2))
@@ -1387,6 +1441,7 @@ vmess_link() {
 # 兼容节点文件由权威配置生成，删除另一种模式避免显示旧节点。
 nodes_refresh() {
     local link
+    if [ "$MODE" = quick ] && ! quick_domain_valid "$DOMAIN"; then return 1; fi
     umask 077
     mkdir -p -m 700 "$NODE_DIR" || return 1
     chmod 700 "$NODE_DIR"
@@ -1412,11 +1467,25 @@ argo_service_up() {
 }
 
 # 读取已保存的固定凭据，恢复时无需用户重新输入密钥。
-argo_service_configure() {
-    if [ "$MODE" = quick ]; then argo_service_up quick "$(argo_quick_args "$PORT")"
-    elif [ -s "$ARGO_TOKEN_FILE" ]; then argo_service_up token "$(argo_token_args)"
-    elif [ -s "$TUNNEL_JSON" ]; then argo_service_up config "$(argo_config_args)"
+argo_service_args() {
+    if [ "$MODE" = quick ]; then argo_quick_args "$PORT"
+    elif [ "$MODE" = fixed ] && [ -s "$ARGO_TOKEN_FILE" ]; then argo_token_args
+    elif [ "$MODE" = fixed ] && [ -s "$TUNNEL_JSON" ]; then argo_config_args
     else echo "错误: 固定隧道缺少 token 文件或 JSON，请重新执行 fixed 安装" >&2; return 1; fi
+}
+
+# 原子刷新已有启动器，运行中的进程不变，下次自动重启也采用新日志规则。
+argo_wrapper_refresh() {
+    local args output=$ARGO_LOG
+    args=$(argo_service_args) || return 1
+    [ "${CORE_LOGS:-1}" = 1 ] || output=/dev/null
+    svc_wrapper "$SVC_ARGO" "/bin/sh -c 'exec \"$CF_BIN\" $args >> \"$output\" 2>&1'"
+}
+
+argo_service_configure() {
+    local args
+    args=$(argo_service_args) || return 1
+    argo_service_up "$MODE" "$args"
 }
 
 LOG_MAX_BYTES=262144
@@ -1808,6 +1877,10 @@ location_refresh() {
 # 发送失败仅对 5xx/000 重试，不修改已上报标记，下一轮可补发。
 report_node() {
     agent_load
+    if [ "$MODE" = quick ] && ! quick_domain_valid "$DOMAIN"; then
+        agent_log ERR "尚未取得有效临时隧道域名，不生成或上报接口地址"
+        return 1
+    fi
     location_refresh
     [ -n "$REPORT_URL" ] || return 0
     local body resp code now link attempt delay verified=false
@@ -1993,7 +2066,7 @@ install_fixed() {
 argo_restart_controlled() {
     [ "${STOP:-0}" != 1 ] || return 1
     local old=$DOMAIN d
-    : > "$ARGO_LOG"
+    argo_wrapper_refresh || { agent_log ERR "cloudflared 启动器更新失败"; return 1; }
     svc_restart "$SVC_ARGO" "$SVC_ARGO" || { agent_log ERR "cloudflared 重启失败"; return 1; }
     [ "$MODE" != fixed ] || old=""
     wait_new_domain "$old" 60 >/dev/null || { agent_log ERR "重启后获取新域名超时"; return 5; }
@@ -2048,7 +2121,7 @@ agent_state_save() {
     return 0
 }
 
-# 每轮只判断一次连接，任一失败直接交给隧道重建，不重试探测。
+# 单次探测检查进程、连接就绪状态和外网握手，由检查轮次确认连续失败。
 remote_probe_once() {
     [ "${STOP:-0}" != 1 ] || return 1
     if ! svc_running "$SVC_ARGO" "$SVC_ARGO"; then
@@ -2069,6 +2142,7 @@ remote_probe_once() {
 agent_startup() {
     agent_env_ensure || return 1
     [[ "$MODE" = quick || "$MODE" = fixed ]] && valid_port "$PORT" || { agent_log ERR "守护缺少已安装的隧道配置"; return 1; }
+    argo_wrapper_refresh || return 1
     if ! svc_running "$SVC_SB" "$SVC_SB"; then svc_restart "$SVC_SB" "$SVC_SB" || sb_service_up || return 1; fi
     if ! svc_running "$SVC_ARGO" "$SVC_ARGO"; then
         : > "$ARGO_LOG"
@@ -2108,9 +2182,9 @@ agent_watch() {
     LAST_WATCH_TS=$now
 }
 
-# 每两小时检查一次，连接失败直接重启 cloudflared，取得新域名后上报。
+# 默认每两小时检查，连续三次失败才重建，重建失败十分钟后再试。
 agent_check() {
-    local now=$1 d
+    local now=$1 d attempt ok=0
     LAST_CHECK_TS=$now; LAST_WATCH_TS=$now
     core_tmp_cleanup || true
     # 自动拉起的 cloudflared 可能已有新域名，先读取当前进程再检查外网连接。
@@ -2122,14 +2196,19 @@ agent_check() {
             nodes_refresh
         fi
     fi
-    if remote_probe_once; then
+    for attempt in 1 2 3; do
+        [ "${STOP:-0}" != 1 ] || return 1
+        if remote_probe_once; then ok=1; break; fi
+        if [ "$attempt" -lt 3 ]; then agent_sleep 10 || return 1; fi
+    done
+    if [ "$ok" = 1 ]; then
         location_refresh
         # 连接正常时仅补发已知变化，不重复上传相同节点。
         if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_node || true; fi
         return 0
     fi
     [ "${STOP:-0}" != 1 ] || return 1
-    agent_log WARN "CF 连接检查失败，立即重建隧道"
+    agent_log WARN "CF 连接连续 3 次检查失败，重建隧道"
     # 源服务停止或不通时一并拉起，保持原端口、UUID 和路径。
     if ! svc_running "$SVC_SB" "$SVC_SB"; then
         svc_restart "$SVC_SB" "$SVC_SB" || sb_service_up || agent_log ERR "sing-box 启动失败"
@@ -2140,7 +2219,9 @@ agent_check() {
         agent_sleep 3 || return 1
     fi
     if ! argo_restart_controlled; then
-        agent_log ERR "本轮隧道重建未完成，下一轮按 ${CHECK_INTERVAL}s 周期检查"
+        [ "${STOP:-0}" != 1 ] || return 1
+        LAST_CHECK_TS=$(($(date +%s)-CHECK_INTERVAL+600))
+        agent_log ERR "本轮隧道重建未完成，600s 后重试"
         return 1
     fi
     [ "${STOP:-0}" != 1 ] || return 1
@@ -2162,7 +2243,7 @@ agent_lock_acquire() {
     flock -n 9 || { exec 9>&-; return 10; }
 }
 
-# once 复用启动与连接检查路径，手动检查时也按单次失败立即重建。
+# once 复用启动与连接检查路径，手动检查也在连续三次失败后重建。
 agent_once() {
     local rc
     STOP=0; trap 'STOP=1' TERM INT
@@ -2188,7 +2269,7 @@ agent_loop_body() {
     RESOURCE_LAST_MAINTENANCE_TS=0
     resource_maintenance "$(date +%s)"
     agent_startup || return 1
-    agent_log INFO "CF 连接检查启动: 每 ${CHECK_INTERVAL}s 检查，失败立即重建并上报新域名"
+    agent_log INFO "CF 连接检查启动: 每 ${CHECK_INTERVAL}s 检查，连续 3 次失败后重建，重建失败 600s 后重试"
     while [ "$STOP" != 1 ]; do
         now=$(date +%s)
         resource_maintenance "$now"
@@ -2312,6 +2393,7 @@ agent_start() {
     [ -n "$MODE" ] || { echo "错误: 请先安装隧道" >&2; return 1; }
     oldmp=$MP
     metrics_port_ensure || return $?
+    argo_wrapper_refresh || return 1
     if [ -z "$oldmp" ] || [ "$oldmp" != "$MP" ]; then
         # 旧服务没 metrics 或端口失效，需要一次受控替换；只有域名变化才会上报。
         svc_stop "$SVC_ARGO" "$SVC_ARGO"
@@ -2328,9 +2410,12 @@ agent_start() {
 
 # 状态只展示服务与非敏感配置，不在终端泄露 REPORT_TOKEN。
 agent_status() {
+    local display_domain status_mode
     printf 'sing-box: %s\ncloudflared: %s\nagent: %s\n' "$(svc_state "$SVC_SB" "$SVC_SB")" "$(svc_state "$SVC_ARGO" "$SVC_ARGO")" "$(svc_state "$SVC_AGENT" "$SVC_AGENT")"
     if [ -f "$AGENT_ENV" ]; then
-        printf '域名: %s\nCF 连接检查: 每 %ss，失败立即重建并上报新域名\n上次成功上报: %s\n' "$(env_get "$AGENT_ENV" DOMAIN)" "$(env_get "$AGENT_ENV" CHECK_INTERVAL)" "$(env_get "$AGENT_ENV" LAST_REPORT_TS)"
+        display_domain=$(env_get "$AGENT_ENV" DOMAIN); status_mode=$(env_get "$AGENT_ENV" MODE)
+        if [ "$status_mode" = quick ] && ! quick_domain_valid "$display_domain"; then display_domain="未取得有效临时隧道域名"; fi
+        printf '域名: %s\nCF 连接检查: 每 %ss，连续 3 次失败后重建，重建失败 600s 后重试\n上次成功上报: %s\n' "$display_domain" "$(env_get "$AGENT_ENV" CHECK_INTERVAL)" "$(env_get "$AGENT_ENV" LAST_REPORT_TS)"
     fi
     if [ "$TUNEL_SYSTEM" != 1 ]; then
         printf '便携目录: %s\n' "$TUNEL_HOME"
