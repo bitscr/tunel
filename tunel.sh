@@ -45,6 +45,10 @@ TUNEL_VERSION="0.0.1"
 DEFAULT_CHECK_INTERVAL=300
 DEFAULT_WATCH_INTERVAL=60
 RECOVERY_RETRY_INTERVAL=300
+PROCESS_CHECK_INTERVAL=30
+PROCESS_RECOVERY_RETRY_AFTER=0
+AGENT_ACTIVE=0
+DOMAIN_SYNC_PENDING=0
 REPORT_RETRY_AFTER=0
 REPORT_RETRY_DOMAIN=""
 LOCATION_MEMORY_ATTEMPT_TS=0
@@ -438,7 +442,7 @@ http_fetch() { # $1=url $2=输出文件
     local __tunel_fetch_limit=${3:-134217728}
     if has curl; then
         # curl 能显式拒绝 HTTP 4xx/5xx，并控制连接与整次下载时间。
-        if [ "${RUN_ACTIVE:-0}" = 1 ]; then
+        if [ "${RUN_ACTIVE:-0}" = 1 ] || [ "$AGENT_ACTIVE" = 1 ]; then
             curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 --max-filesize "$__tunel_fetch_limit" -o "$2" "$1" 7>&- 9>&- &
         else
             curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 --max-filesize "$__tunel_fetch_limit" -o "$2" "$1" 9>&-
@@ -446,7 +450,7 @@ http_fetch() { # $1=url $2=输出文件
         fi
     elif has wget; then
         # 保留只有 wget 的 minimal 系统下载兼容。
-        if [ "${RUN_ACTIVE:-0}" = 1 ]; then wget -q -T 30 -t 3 -O "$2" "$1" 7>&- 9>&- &
+        if [ "${RUN_ACTIVE:-0}" = 1 ] || [ "$AGENT_ACTIVE" = 1 ]; then wget -q -T 30 -t 3 -O "$2" "$1" 7>&- 9>&- &
         else wget -q -T 30 -t 3 -O "$2" "$1" 9>&-; return $?; fi
     else
         # 不假装下载成功，调用者会返回依赖失败退出码。
@@ -454,9 +458,12 @@ http_fetch() { # $1=url $2=输出文件
         echo -e "${yellow}请先安装其一（Alpine: apk add curl / Debian: apt-get install -y curl）${re}" >&2
         return 127
     fi
-    # 前台下载使用可中断的 wait，TERM 不必等完最长 600 秒的同步下载。
+    # 守护及前台下载保持日志保养，TERM 不必等完整次下载和重试。
     local fetch_pid=$! rc
     RUN_FETCH_PID=$fetch_pid; RUN_FETCH_START=$(proc_start_time "$fetch_pid")
+    while [ "${STOP:-0}" != 1 ] && [ -n "$RUN_FETCH_START" ] && [ "$(proc_start_time "$fetch_pid")" = "$RUN_FETCH_START" ]; do
+        agent_sleep 5 || break
+    done
     if [ "${STOP:-0}" != 1 ]; then wait "$fetch_pid"; rc=$?; else rc=1; fi
     if [ "${STOP:-0}" = 1 ]; then
         run_request_stop
@@ -1502,6 +1509,45 @@ argo_service_configure() {
     argo_service_up "$MODE" "$args" "${1:-restart}"
 }
 
+# 丢失进程时修复核心与服务注册，保留已有节点身份和配置。
+sb_service_restore() {
+    install_singbox_core || { agent_log ERR "sing-box 核心恢复失败"; return 1; }
+    if [ ! -s "$SB_CFG" ] || ! "$SB_BIN" check -c "$SB_CFG" >/dev/null 2>&1; then
+        sb_write_config "$PORT" "$UUID" "$WS_PATH" || return 1
+    fi
+    sb_service_up "${1:-start}"
+}
+
+argo_service_restore() {
+    install_cloudflared || { agent_log ERR "cloudflared 核心恢复失败"; return 1; }
+    metrics_port_ensure || return 1
+    argo_service_configure "${1:-start}"
+}
+
+core_services_missing() {
+    [ ! -x "$CF_BIN" ] || [ ! -x "$SB_BIN" ] || [ ! -s "$SB_CFG" ] ||
+        ! svc_running "$SVC_ARGO" "$SVC_ARGO" || ! svc_running "$SVC_SB" "$SVC_SB"
+}
+
+agent_identity_valid() {
+    [[ "$MODE" = quick || "$MODE" = fixed ]] && valid_port "$PORT" &&
+        [[ "$UUID" =~ ^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$ ]] &&
+        [[ "$WS_PATH" =~ ^/[A-Za-z0-9/_-]{0,127}$ ]]
+}
+
+agent_core_ensure() {
+    runtime_dirs_ensure || return 1
+    agent_identity_valid || { agent_log ERR "守护缺少有效的已安装节点配置"; return 1; }
+    if [ ! -x "$SB_BIN" ] || [ ! -s "$SB_CFG" ] || ! svc_running "$SVC_SB" "$SVC_SB"; then
+        sb_service_restore || return 1
+    fi
+    if [ ! -x "$CF_BIN" ] || ! svc_running "$SVC_ARGO" "$SVC_ARGO"; then
+        argo_service_restore || return 1
+    else
+        argo_wrapper_refresh || return 1
+    fi
+}
+
 LOG_MAX_BYTES=262144
 LOG_KEEP_BYTES=65536
 RESOURCE_MAINTENANCE_INTERVAL=30
@@ -1938,6 +1984,8 @@ report_node() {
 # 自动补发按域名共享退避，新域名可立即上报，手动 report 不受此限制。
 report_pending() {
     [ -n "${REPORT_URL:-}" ] && [ -n "${DOMAIN:-}" ] && [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ] || return 0
+    [ "$DOMAIN_SYNC_PENDING" != 1 ] || return 0
+    svc_running "$SVC_ARGO" "$SVC_ARGO" && svc_running "$SVC_SB" "$SVC_SB" || return 0
     local now
     now=$(date +%s)
     if [ "$DOMAIN" = "$REPORT_RETRY_DOMAIN" ] && [ "$now" -lt "$REPORT_RETRY_AFTER" ]; then return 0; fi
@@ -2095,16 +2143,18 @@ install_fixed() {
 argo_restart_controlled() {
     [ "${STOP:-0}" != 1 ] || return 1
     local old=$DOMAIN d
-    argo_wrapper_refresh || { agent_log ERR "cloudflared 启动器更新失败"; return 1; }
-    svc_restart "$SVC_ARGO" "$SVC_ARGO" || { agent_log ERR "cloudflared 重启失败"; return 1; }
+    if [ ! -x "$CF_BIN" ] || ! svc_running "$SVC_ARGO" "$SVC_ARGO"; then
+        argo_service_restore || return 1
+        old=""
+    else
+        argo_wrapper_refresh || { agent_log ERR "cloudflared 启动器更新失败"; return 1; }
+        svc_restart "$SVC_ARGO" "$SVC_ARGO" || argo_service_restore restart || { agent_log ERR "cloudflared 重启失败"; return 1; }
+    fi
     [ "$MODE" != fixed ] || old=""
     wait_new_domain "$old" 60 >/dev/null || { agent_log ERR "重启后获取新域名超时"; return 5; }
     d=$WAIT_DOMAIN
-    DOMAIN=$d
-    env_set "$AGENT_ENV" DOMAIN "$DOMAIN" && env_set "$AGENT_ENV" LAST_DOMAIN_TS "$(date +%s)" || {
-        agent_log ERR "新域名保存失败: $AGENT_ENV"; return 1
-    }
-    nodes_refresh || { agent_log ERR "新域名节点文件更新失败: $NODE_DIR"; return 1; }
+    svc_running "$SVC_ARGO" "$SVC_ARGO" && svc_running "$SVC_SB" "$SVC_SB" || return 1
+    agent_domain_save "$d" "$(date +%s)" || return 1
     agent_log INFO "隧道已重建，当前域名: $DOMAIN"
     return 0
 }
@@ -2167,44 +2217,83 @@ remote_probe_once() {
     return 1
 }
 
-# 启动时先确保依赖，再从当前进程获取域名；已有相同上报不写 Worker。
+# 保存失败时保留待同步状态，同域名下一轮也会重试配置和节点文件。
+agent_domain_save() {
+    local d=$1 now=$2 old=$DOMAIN
+    [ -n "$d" ] || return 1
+    [ "$MODE" != quick ] || quick_domain_valid "$d" || return 1
+    if [ "$d" != "$DOMAIN" ] || [ "$DOMAIN_SYNC_PENDING" = 1 ] || [ "$d" != "$(env_get "$NODE_DIR/$MODE.env" DOMAIN)" ] || [ ! -s "$NODE_DIR/$MODE.txt" ]; then
+        [ "$d" = "$DOMAIN" ] || agent_log INFO "当前进程域名变化: $DOMAIN -> $d"
+        DOMAIN=$d
+        if ! env_set "$AGENT_ENV" DOMAIN "$DOMAIN" || ! env_set "$AGENT_ENV" LAST_DOMAIN_TS "$now" || ! nodes_refresh; then
+            DOMAIN=$old; DOMAIN_SYNC_PENDING=1
+            agent_log ERR "当前域名保存未完成，保留待同步状态"
+            return 1
+        fi
+        DOMAIN_SYNC_PENDING=0
+    fi
+    return 0
+}
+
+# 同步当前活进程的域名，不要求再次更换已被系统自动恢复的隧道。
+agent_domain_sync() {
+    wait_new_domain "" "${1:-60}" >/dev/null || return 1
+    [ "${STOP:-0}" != 1 ] || return 1
+    svc_running "$SVC_ARGO" "$SVC_ARGO" && svc_running "$SVC_SB" "$SVC_SB" || return 1
+    agent_domain_save "$WAIT_DOMAIN" "$(date +%s)"
+}
+
+agent_recovery_defer() {
+    local now
+    now=$(date +%s)
+    LAST_CHECK_TS=$((now-CHECK_INTERVAL+RECOVERY_RETRY_INTERVAL))
+    PROCESS_RECOVERY_RETRY_AFTER=$((now+RECOVERY_RETRY_INTERVAL))
+    agent_log ERR "$1，${RECOVERY_RETRY_INTERVAL}s 后重试"
+}
+
+# 启动恢复失败时保持守护和日志保养，避免服务管理器反复触发核心下载。
 agent_startup() {
     agent_env_ensure || return 1
-    [[ "$MODE" = quick || "$MODE" = fixed ]] && valid_port "$PORT" || { agent_log ERR "守护缺少已安装的隧道配置"; return 1; }
-    argo_wrapper_refresh || return 1
-    if ! svc_running "$SVC_SB" "$SVC_SB"; then svc_restart "$SVC_SB" "$SVC_SB" || sb_service_up || return 1; fi
-    if ! svc_running "$SVC_ARGO" "$SVC_ARGO"; then
-        : > "$ARGO_LOG"
-        svc_restart "$SVC_ARGO" "$SVC_ARGO" || argo_service_configure || return 1
-    fi
-    local d
-    wait_new_domain "" 90 >/dev/null || { agent_log ERR "守护启动未取得域名，下一轮自检继续恢复"; return 0; }
-    d=$WAIT_DOMAIN
-    [ "${STOP:-0}" != 1 ] || return 0
-    if [ "$d" != "$DOMAIN" ]; then
-        agent_log INFO "启动域名变化: $DOMAIN -> $d"
-        DOMAIN=$d; env_set "$AGENT_ENV" DOMAIN "$DOMAIN"; env_set "$AGENT_ENV" LAST_DOMAIN_TS "$(date +%s)"
-        nodes_refresh
+    agent_identity_valid || { agent_log ERR "守护缺少有效的已安装节点配置"; return 1; }
+    if ! agent_core_ensure || ! agent_domain_sync 90; then
+        agent_recovery_defer "守护启动恢复未完成"
+        return 0
     fi
     location_refresh
     if [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_pending || true; fi
 }
 
+# 仅检查本机组件，确认进程丢失即恢复；失败期间仍检查是否已被系统自动拉起。
+agent_process_watch() {
+    local now=$1
+    [ "$((now-${LAST_PROCESS_TS:-0}))" -ge "$PROCESS_CHECK_INTERVAL" ] || return 0
+    LAST_PROCESS_TS=$now
+    if core_services_missing; then
+        [ "$now" -ge "$PROCESS_RECOVERY_RETRY_AFTER" ] || return 0
+        agent_check "$now"
+    else
+        PROCESS_RECOVERY_RETRY_AFTER=0
+    fi
+}
+
 # 自定义同步周期早于连接检查时，仅同步当前域名与待补发的变化。
 agent_watch() {
     local now=$1 d
+    if ! svc_running "$SVC_ARGO" "$SVC_ARGO" || ! svc_running "$SVC_SB" "$SVC_SB"; then
+        LAST_WATCH_TS=$now
+        return 0
+    fi
     if [ "$MODE" = quick ]; then
         d=$(domain_from_metrics 9>&-)
-        if [ -n "$d" ] && [ "$d" != "$DOMAIN" ]; then
-            agent_log INFO "域名变化: $DOMAIN -> $d"
-            DOMAIN=$d; env_set "$AGENT_ENV" DOMAIN "$DOMAIN"; env_set "$AGENT_ENV" LAST_DOMAIN_TS "$now"
-            nodes_refresh; WATCH_EMPTY_WARNED=0
+        if [ -n "$d" ]; then
+            agent_domain_save "$d" "$now" || { LAST_WATCH_TS=$now; return 1; }
+            WATCH_EMPTY_WARNED=0
         elif [ -z "$d" ]; then
             # 监视仅告警不恢复，避免短暂 metrics 不可用导致反复重启。
             if [ "${WATCH_EMPTY_WARNED:-0}" != 1 ]; then agent_log WARN "本机 metrics 暂无域名，等待远端自检"; WATCH_EMPTY_WARNED=1; fi
-        else
-            WATCH_EMPTY_WARNED=0
         fi
+    elif [ "$DOMAIN_SYNC_PENDING" = 1 ]; then
+        agent_domain_save "$DOMAIN" "$now" || { LAST_WATCH_TS=$now; return 1; }
     fi
     # 上报失败不会更新 LAST_REPORTED_DOMAIN，这里只补发已知变更，不是心跳。
     if [ -n "$DOMAIN" ] && [ "$DOMAIN" != "$LAST_REPORTED_DOMAIN" ]; then report_pending || true; fi
@@ -2216,13 +2305,29 @@ agent_check() {
     local now=$1 d attempt ok=0
     LAST_CHECK_TS=$now; LAST_WATCH_TS=$now
     core_tmp_cleanup || true
+    if core_services_missing; then
+        agent_log WARN "本机核心进程或文件丢失，立即恢复服务并同步域名"
+        if ! agent_core_ensure || ! agent_domain_sync; then
+            agent_recovery_defer "本机组件恢复未完成"
+            return 1
+        fi
+        PROCESS_RECOVERY_RETRY_AFTER=0
+        location_refresh
+        if ! report_pending; then
+            LAST_CHECK_TS=$(($(date +%s)-CHECK_INTERVAL+RECOVERY_RETRY_INTERVAL))
+            agent_log WARN "本机组件已恢复，但上报失败，${RECOVERY_RETRY_INTERVAL}s 后补发"
+        else
+            LAST_CHECK_TS=$(date +%s)
+        fi
+        LAST_WATCH_TS=$(date +%s)
+        return 0
+    fi
     # 自动拉起的 cloudflared 可能已有新域名，先读取当前进程再检查外网连接。
     if svc_running "$SVC_ARGO" "$SVC_ARGO"; then
         d=$(get_domain 9>&-)
-        if [ -n "$d" ] && [ "$d" != "$DOMAIN" ]; then
-            agent_log INFO "域名变化: $DOMAIN -> $d"
-            DOMAIN=$d; env_set "$AGENT_ENV" DOMAIN "$DOMAIN"; env_set "$AGENT_ENV" LAST_DOMAIN_TS "$now"
-            nodes_refresh
+        if [ -n "$d" ] && ! agent_domain_save "$d" "$now"; then
+            agent_recovery_defer "当前域名保存未完成"
+            return 1
         fi
     fi
     for attempt in 1 2 3; do
@@ -2242,18 +2347,17 @@ agent_check() {
     [ "${STOP:-0}" != 1 ] || return 1
     agent_log WARN "CF 连接连续 3 次检查失败，重建隧道"
     # 源服务停止或不通时一并拉起，保持原端口、UUID 和路径。
-    if ! svc_running "$SVC_SB" "$SVC_SB"; then
-        svc_restart "$SVC_SB" "$SVC_SB" || sb_service_up || agent_log ERR "sing-box 启动失败"
-        agent_sleep 3 || return 1
-    elif ! ws_probe "http://127.0.0.1:$PORT$WS_PATH"; then
+    if ! ws_probe "http://127.0.0.1:$PORT$WS_PATH"; then
         probe_log 本地
-        svc_restart "$SVC_SB" "$SVC_SB" || agent_log ERR "sing-box 重启失败"
+        if ! sb_service_restore restart; then
+            agent_recovery_defer "源服务恢复未完成"
+            return 1
+        fi
         agent_sleep 3 || return 1
     fi
     if ! argo_restart_controlled; then
         [ "${STOP:-0}" != 1 ] || return 1
-        LAST_CHECK_TS=$(($(date +%s)-CHECK_INTERVAL+RECOVERY_RETRY_INTERVAL))
-        agent_log ERR "本轮隧道重建未完成，${RECOVERY_RETRY_INTERVAL}s 后重试"
+        agent_recovery_defer "本轮隧道重建未完成"
         return 1
     fi
     [ "${STOP:-0}" != 1 ] || return 1
@@ -2283,13 +2387,16 @@ agent_once() {
     agent_lock_acquire; rc=$?
     if [ "$rc" = 10 ]; then trap - TERM INT; return 0
     elif [ "$rc" != 0 ]; then trap - TERM INT; return "$rc"; fi
+    AGENT_ACTIVE=1
     agent_state_load
     resource_maintenance "$(date +%s)"
     if agent_startup; then
-        agent_check "$(date +%s)"; rc=$?
+        if [ "$(date +%s)" -ge "$PROCESS_RECOVERY_RETRY_AFTER" ]; then agent_check "$(date +%s)"; rc=$?
+        else rc=1; fi
         agent_state_save
     else rc=1; fi
     exec 9>&-
+    AGENT_ACTIVE=0
     trap - TERM INT
     return "$rc"
 }
@@ -2298,17 +2405,20 @@ agent_once() {
 agent_loop_body() {
     local now
     WATCH_EMPTY_WARNED=0
+    LAST_PROCESS_TS=0; PROCESS_RECOVERY_RETRY_AFTER=0
     agent_state_load
     RESOURCE_LAST_MAINTENANCE_TS=0
     resource_maintenance "$(date +%s)"
     agent_startup || return 1
     # 每次启动都检查当前连接，开机网络未就绪不能沿用上次运行的检查等待。
     agent_log INFO "守护启动，立即检查当前连接并同步域名"
-    agent_check "$(date +%s)"
-    agent_log INFO "CF 连接检查启动: 每 ${CHECK_INTERVAL}s 检查，域名同步每 ${WATCH_INTERVAL}s，连续 3 次失败后重建，重建失败 ${RECOVERY_RETRY_INTERVAL}s 后重试"
+    if [ "$(date +%s)" -ge "$PROCESS_RECOVERY_RETRY_AFTER" ]; then agent_check "$(date +%s)"; fi
+    agent_log INFO "CF 检查启动: 本机进程每 ${PROCESS_CHECK_INTERVAL}s，远端连接每 ${CHECK_INTERVAL}s，域名同步每 ${WATCH_INTERVAL}s；进程丢失立即恢复，远端连续 3 次失败后重建，恢复失败 ${RECOVERY_RETRY_INTERVAL}s 后重试"
     while [ "$STOP" != 1 ]; do
         now=$(date +%s)
         resource_maintenance "$now"
+        agent_process_watch "$now"
+        now=$(date +%s)
         if [ "$((now-LAST_CHECK_TS))" -ge "$CHECK_INTERVAL" ]; then
             agent_check "$now"
         elif [ "$WATCH_INTERVAL" -gt 0 ] && [ "$((now-LAST_WATCH_TS))" -ge "$WATCH_INTERVAL" ]; then
@@ -2327,7 +2437,9 @@ agent_loop() {
     agent_lock_acquire; rc=$?
     if [ "$rc" = 10 ]; then trap - TERM INT; return 0
     elif [ "$rc" != 0 ]; then trap - TERM INT; return "$rc"; fi
+    AGENT_ACTIVE=1
     agent_loop_body; rc=$?
+    AGENT_ACTIVE=0
     exec 9>&-
     trap - TERM INT
     return "$rc"
@@ -2366,8 +2478,8 @@ run_foreground() {
     fi
     dependencies_ensure || return 3
     agent_env_ensure || return 1
-    [[ "$MODE" = quick || "$MODE" = fixed ]] && valid_port "$PORT" && [ -x "$SB_BIN" ] && [ -x "$CF_BIN" ] && [ -s "$SB_CFG" ] || {
-        echo "错误: run 缺少有效的已安装隧道配置或核心，请先执行 quick/fixed。" >&2; return 1
+    agent_identity_valid || {
+        echo "错误: run 缺少有效的已安装节点配置，请先执行 quick/fixed。" >&2; return 1
     }
     # 生命周期锁先阻止两个 run 同时修改 ctl/PID，核心进程不会继承此 FD。
     exec 7>"$RUN_DIR/cf-tunel-run.lock" || { echo "错误: 无法创建前台锁 $RUN_DIR/cf-tunel-run.lock" >&2; return 1; }
@@ -2426,14 +2538,15 @@ agent_start() {
     dependencies_ensure || return 3
     agent_env_ensure || return 1
     [ "$SELF_INSTALL_DONE" = 1 ] || install_self || return 3
-    [ -n "$MODE" ] || { echo "错误: 请先安装隧道" >&2; return 1; }
+    agent_identity_valid || { echo "错误: 请先安装有效的隧道配置" >&2; return 1; }
     oldmp=$MP
     metrics_port_ensure || return $?
     if [ -z "$oldmp" ] || [ "$oldmp" != "$MP" ]; then
         # 旧服务没 metrics 或端口失效，需要一次受控替换；只有域名变化才会上报。
         svc_stop "$SVC_ARGO" "$SVC_ARGO" || return 1
     fi
-    sb_service_up start && argo_service_configure start || return 1
+    sb_service_up start || sb_service_restore || return 1
+    argo_service_configure start || argo_service_restore || return 1
     if [ "$ENV_INIT" = none ]; then
         boot_hook_install || return 1
     fi
@@ -2447,7 +2560,7 @@ agent_status() {
     if [ -f "$AGENT_ENV" ]; then
         display_domain=$(env_get "$AGENT_ENV" DOMAIN); status_mode=$(env_get "$AGENT_ENV" MODE)
         if [ "$status_mode" = quick ] && ! quick_domain_valid "$display_domain"; then display_domain="未取得有效临时隧道域名"; fi
-        printf '域名: %s\nCF 连接检查: 每 %ss，域名同步每 %ss，连续 3 次失败后重建，重建失败 %ss 后重试\n上次成功上报: %s\n' "$display_domain" "$(env_get "$AGENT_ENV" CHECK_INTERVAL)" "$(env_get "$AGENT_ENV" WATCH_INTERVAL)" "$RECOVERY_RETRY_INTERVAL" "$(env_get "$AGENT_ENV" LAST_REPORT_TS)"
+        printf '域名: %s\n本机进程检查: 每 %ss，进程丢失立即恢复\nCF 连接检查: 每 %ss，域名同步每 %ss，连续 3 次失败后重建，恢复失败 %ss 后重试\n上次成功上报: %s\n' "$display_domain" "$PROCESS_CHECK_INTERVAL" "$(env_get "$AGENT_ENV" CHECK_INTERVAL)" "$(env_get "$AGENT_ENV" WATCH_INTERVAL)" "$RECOVERY_RETRY_INTERVAL" "$(env_get "$AGENT_ENV" LAST_REPORT_TS)"
     fi
     if [ "$TUNEL_SYSTEM" != 1 ]; then
         printf '便携目录: %s\n' "$TUNEL_HOME"
