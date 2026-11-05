@@ -1,25 +1,24 @@
-# tunel
+# tunel 安装指南
 
-tunel 在 Linux VPS 或容器中安装 sing-box 与 Cloudflare Tunnel，生成 VMess-WS 节点，并通过 Cloudflare Worker 管理记录和订阅。当前版本为 `0.0.1`。
+安装顺序：部署 Worker → 安装服务器端 → 导入订阅。
 
-节点名称显示国家和地区，例如 `美国 · California`；本机使用 `US · California` 或 `US-CA`，无法确认时显示 `未识别地区`。位置查询会避开 WARP 出口，避免把 Cloudflare 的位置当作服务器位置。
+只使用独立隧道时，可以跳过 Worker 部署，并省略安装命令中的上报参数。
 
-## 安装前准备
+## 1. 安装前准备
 
-- 支持 Linux AMD64、ARM64、ARMv7 与 386。下载脚本前需要 bash、curl 和 CA 证书。
-- 用户模式和容器需预装 tar、base64、sha256sum、flock（util-linux）、nohup、awk、sed、grep、tr 及常规 coreutils；便携模式不会调用系统包管理器。
-- 每次安装核心至少需要 128MiB 可用空间，另需容纳安装后的二进制。项目带有日志整理和低资源保护，实际用量仍取决于连接数。
+- 使用管理面板和订阅时，需要 Cloudflare 账号。
+- 服务器支持 Linux AMD64、ARM64、ARMv7 与 386；预装 bash、curl 和 CA 证书。
+- 普通用户及容器安装还需预装 tar、base64、sha256sum、flock（util-linux）、nohup、awk、sed、grep、tr 及常规 coreutils。
+- 至少预留 128MiB 下载空间，并另留核心程序的安装空间。
 
-使用管理面板和订阅时先部署 Worker；独立使用隧道可以省略上报参数。
-
-## 部署 Worker
+## 2. 部署 Worker
 
 ### Cloudflare 网页编辑器
 
 1. 创建 Worker 和 KV namespace，在 Worker Settings 中绑定 KV，名称必须是 `TUNEL_KV`。
 2. 添加两个不同的 secrets：`ADMIN_TOKEN` 用于管理，`REPORT_TOKEN` 用于服务器上报。建议使用足够长、无空白和引号的随机 ASCII 值。
-3. 用 [worker/_worker.js](worker/_worker.js) 的完整内容替换入口文件，保存并部署；入口叫 `work.js` 也可以。
-4. 打开 `https://your-worker.workers.dev/ui`，使用 ADMIN_TOKEN 登录，从设置页复制安装命令。
+3. 用 [worker/_worker.js](worker/_worker.js) 的完整内容替换入口文件，保存并部署。
+4. 打开 `https://your-worker.workers.dev/ui`，使用 `ADMIN_TOKEN` 登录。
 
 兼容日期可使用 `2026-01-01`。网页编辑器不会自动读取 [worker/wrangler.toml](worker/wrangler.toml)，绑定和变量需在 Settings 中配置。
 
@@ -32,13 +31,12 @@ tunel 在 Linux VPS 或容器中安装 sing-box 与 Cloudflare Tunnel，生成 V
 | `SUBCONFIG` | 可选 var | 转换配置，默认值见 wrangler.toml |
 | `SUBNAME` | 可选 var | 订阅文件名，默认 `tunel` |
 | `CFIP` | 可选 var | 初始连接地址，面板保存后使用面板设置 |
+| `SUB` | 可选 var | 初始优选订阅器域名或 URL，面板可保存覆盖或关闭 |
 | `UPSTREAM` | 可选 var | 初始远程订阅 URL，换行或逗号分隔 |
 
-根路径公开显示 nginx 欢迎页；管理功能需要上述三个必填配置。
+### Wrangler（可选）
 
-### Wrangler / Pages
-
-在 `worker/` 目录执行：
+先安装 Node.js/npm，再在 `worker/` 目录执行：
 
 ```sh
 npx wrangler login
@@ -53,13 +51,19 @@ npx wrangler secret put REPORT_TOKEN
 npx wrangler deploy
 ```
 
-Pages 高级模式也可使用同一份 `_worker.js`：项目根目录为 `worker/`，构建命令留空、输出目录为 `.`；绑定 KV 和 secrets 后重新部署，生产与预览环境分别配置。
+### Pages（可选）
 
-## 安装服务器端
+1. 使用 Pages 高级模式，项目根目录设为 `worker/`，构建命令留空，输出目录设为 `.`。
+2. 在生产环境绑定 `TUNEL_KV`，添加 `ADMIN_TOKEN` 和 `REPORT_TOKEN`，然后重新部署；使用预览环境时也需单独配置。
+3. 打开 Pages 域名下的 `/ui`，使用 `ADMIN_TOKEN` 登录。
 
-设置页的「一键安装并启动服务」会复制包含实际域名和凭据的命令。下面的手工示例需要替换部署域名及 ASCII 占位值。
+## 3. 安装服务器端
 
-临时隧道：
+推荐在管理面板「设置」页复制「一键安装并启动服务」命令，到服务器终端执行。
+
+手工安装时，使用下面的命令，并替换域名及所有 `REPLACE_*` 占位值。
+
+### 临时隧道
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh \
@@ -67,7 +71,9 @@ curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh \
     --report-token 'REPLACE_REPORT_TOKEN' -y
 ```
 
-固定隧道：先在 Cloudflare 创建隧道和公开主机名，将源服务设为 `http://127.0.0.1:18080`；安装端口必须与其一致。
+### 固定隧道
+
+先在 Cloudflare 创建隧道和公开主机名，将源服务设为 `http://127.0.0.1:18080`；安装端口必须与其一致。
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh \
@@ -76,21 +82,36 @@ curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh \
     --report-token 'REPLACE_REPORT_TOKEN' -y
 ```
 
-固定模式也可使用 `--json-file /path/to/tunnel.json`，与 `--token` 二选一。上报 URL 与 token 必须同时提供或同时省略；独立安装省略这两个参数即可。取得有效域名后会显示节点链接和服务状态，可直接导入客户端。
+使用 JSON 凭据时，将 `--token 'REPLACE_TUNNEL_TOKEN'` 换成 `--json-file /path/to/tunnel.json`。不使用管理面板时，同时删除 `--report-url` 和 `--report-token`。
 
-首次取域名失败会显示错误、服务状态和有限日志，退出码为 5；脚本与配置已保存，默认启动守护继续恢复，取得有效域名后更新节点并上报。Cloudflare 申请临时隧道返回 HTTP 429 时，至少等待 1 小时再申请。使用 `--no-agent` 时需手动启动 `agent start` 或容器入口 `run`；恢复后执行 `node` 查看节点。
+安装完成后，按下表选择管理命令，执行 `node` 查看节点与服务状态。
 
 ### 系统安装与普通用户
 
-root 默认使用 `/etc/cf-tunel`、`/usr/local/bin/tunel` 和 `/var/log/cf-tunel`。系统目录不可写时，安装会自动退到 `$HOME/.local/share/tunel` 并显示实际路径；普通用户默认使用该用户目录。
+| 安装方式 | 管理命令 |
+| --- | --- |
+| root 默认系统安装 | `tunel` |
+| 普通用户安装 | `"$HOME/.local/share/tunel/bin/tunel"` |
+| 自定义目录 | `<TUNEL_HOME>/bin/tunel` |
 
-默认系统安装会为 sing-box、cloudflared 和守护配置开机自启。systemd 等待 network-online；网络晚到时由守护继续恢复。使用 `--no-agent` 时不启用守护自启，便携与容器沿用各自的启动方式。
+系统目录不可写时会自动改用用户目录，以安装输出的实际路径为准。系统安装默认配置开机自启；普通用户安装需自行配置开机启动。
 
-显式设置 `TUNEL_HOME` 可选择便携目录，出错时会报错；它必须是专用、可写的 ASCII 绝对路径，不能含空格、引号、特殊字符或 `.` / `..` 路径段。新安装不会自动迁移旧安装。
+使用 `TUNEL_HOME` 指定自定义目录时，选择专用、可写的 ASCII 绝对路径，不要包含空格、引号、特殊字符或 `.` / `..` 路径段。
 
-系统安装使用 `tunel` 命令；用户安装使用 `"$HOME/.local/share/tunel/bin/tunel"`，自定义目录使用其 `bin/tunel`。后续按安装时显示的路径管理。
+### 可选安装参数
 
-### 持久化容器
+| 参数 | 用法 |
+| --- | --- |
+| `--port N` | 指定未占用的监听端口，范围 1–65535；默认随机 |
+| `--name X` | 设置管理页中的机器名称 |
+| `--node-id ID` | 设置 4–64 位字母、数字、下划线或短横线组成的 ID；克隆机器使用独立 ID |
+| `--cfip H` | 设置单个连接 IP / 域名；批量地址在面板 CFIP 中填写 |
+| `--no-agent` | 不启动后台守护；后续手动执行 `agent start` 或容器入口 `run` |
+| `-y` / `--yes` | 非交互安装 |
+
+完整参数执行 `tunel help` 查看。
+
+### 持久化容器（可选）
 
 先挂载持久卷到 `/data/tunel`，预装上述依赖，再在运行中的容器内下载并安装：
 
@@ -111,41 +132,44 @@ entrypoint: ["/data/tunel/bin/tunel", "run"]
 stop_grace_period: 45s
 ```
 
-`run` 用于无 init / 便携环境，读取持久化配置、前台运行并在正常停止时关闭本安装的核心进程。容器重启依靠入口恢复，不要只在镜像构建阶段启动后台进程。
+## 4. 导入订阅与设置优选
 
-## 参数与常用命令
+### 导入订阅
 
-安装选项支持 `--参数 值` 和 `--参数=值`：
+1. 登录管理面板 `/ui`，在「记录」页确认服务器节点已上报。
+2. 打开「访问链接」，复制客户端对应的通用、Clash、sing-box、Surge、Quantumult X 或 Loon 订阅地址。
+3. 在客户端添加订阅并更新。
 
-| 参数 | 说明 |
-| --- | --- |
-| `--port N` | 本地监听端口，默认随机；显式端口须为 1–65535 且未占用 |
-| `--name X` | 管理页的机器名称，默认主机名；订阅名称仍使用国家地区 |
-| `--node-id ID` | 自定义 4–64 位字母、数字、下划线或短横线；克隆机器需独立 ID |
-| `--cfip H` | 单一连接 IP / 域名；批量地址使用面板 CFIP |
-| `--check-interval S` | 统一周期，固定为 3600（1 小时） |
-| `--watch-interval S` | 兼容旧参数，只接受 3600；域名同步已合并到统一轮次 |
-| `--no-agent` | 不启动后台守护；取得有效节点且配置了上报时仍首次上报，容器可随后启动 run |
-| `-y` / `--yes` | 非交互安装 |
+需要添加手工节点或远程订阅时，在「数据源」中填写并保存。
 
-也可使用 `TUNEL_HOME`、`TUNEL_NODE_NAME`、`TUNEL_NODE_ID`、`TUNEL_CFIP`、`TUNEL_REPORT_URL`、`TUNEL_REPORT_TOKEN` 环境变量。
+### 设置优选（可选）
+
+1. 打开「设置」页，在「优选订阅器」中填写可用的订阅器域名或完整 HTTP(S) 订阅 URL。
+2. 在「CFIP 优选域名 / IP」中填写备用地址，一行一个，也可用逗号分隔；端口默认 443，IPv6 指定端口时使用 `[IPv6]:端口`。
+3. 点击「保存连接设置」，再到客户端更新订阅。
+
+优选订阅器按 cmliu/edgetunnel 官方协议拉取：固定请求所填域名的 `/sub?host=example.com&uuid=00000000-0000-4000-8000-000000000000`，使用官方格式的 User-Agent，不附加 `b64`。填写完整 URL 时，其路径与查询参数会被忽略；需要 token 或自定义路径的普通订阅 URL 应放到「数据源」的远程订阅中。
+
+不使用优选订阅器时清空该字段并保存；清空 CFIP 可停用手工优选地址。保存后以面板设置为准。
+
+## 5. 管理与更新
+
+普通用户和自定义目录安装，将下面的 `tunel` 替换为实际管理命令。
 
 | 命令 | 用途 |
 | --- | --- |
-| `tunel` / `tunel menu` | 交互菜单；无终端时使用明确子命令 |
+| `tunel` / `tunel menu` | 打开交互菜单 |
 | `tunel node` | 显示节点与服务状态 |
 | `tunel agent status` / `tunel agent log` | 查看守护状态 / 日志 |
 | `tunel agent start` / `tunel agent stop` / `tunel agent restart` | 启动、停止或重启守护，动作任选一个 |
 | `tunel agent once` | 手动执行一轮检查 |
 | `tunel restart` / `tunel report` | 重建隧道 / 手动上报 |
-| `tunel config K=V ...` | 修改配置 |
+| `tunel config K=V ...` | 修改配置，可用参数见 `tunel help` |
 | `tunel version` / `tunel help` | 版本 / 完整用法 |
-
-config 支持 REPORT_URL、REPORT_TOKEN、NODE_NAME、CFIP、CHECK_INTERVAL、WATCH_INTERVAL。周期统一为 3600 秒；两个旧周期参数只接受 3600，不再分别控制进程巡检、域名同步或重建。启动守护时会自动将旧安装中的周期迁移为 3600 秒。
 
 ### 更新已有安装
 
-已有安装更新脚本并启动守护，自动迁移旧周期。root 默认系统安装执行：
+root 默认系统安装执行：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh | bash -s -- agent start
@@ -157,23 +181,9 @@ curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh | bash -
 curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh | TUNEL_HOME="$HOME/.local/share/tunel" bash -s -- agent start
 ```
 
-自动兜底或自定义目录须沿用原目录。脚本更新会刷新本地脚本与三个服务的自启配置，并将旧周期迁移为 1 小时；保留既有 UUID、端口、路径和上报配置，无需重新填写上报 token。旧 quick 启动器会受控重启以取消旧的短等待，域名变化后会更新订阅。更新后的守护立即执行一轮，随后每小时执行一轮。
+自定义目录须使用原来的 `TUNEL_HOME`。更新后执行 `node` 查看状态，并在客户端刷新订阅。
 
-## 日常使用
-
-在 `/ui` 的「记录」按机器名称区分服务器，默认使用主机名；订阅里的节点名称仍只使用国家地区。「数据源」保存手工链接或远程订阅，「访问链接」复制通用、Clash、sing-box、Surge、Quantumult X 或 Loon 订阅。订阅支持 GET / HEAD；保存后刷新订阅，跨区传播仍可能短暂延迟。
-
-设置页 CFIP 支持换行或逗号分隔的 IP / 域名及可选端口，默认端口 443；指定 IPv6 端口时使用 `[IPv6]:端口`。保存空 CFIP 会关闭自定义连接地址，不再回退环境变量；CFIP 不改变国家地区名称。
-
-守护启动立即执行一轮，此后统一每 1 小时执行一轮：检查 cloudflared、sing-box 进程与文件，同步当前临时域名，只检查一次外网连接，并补发待上报内容。进程或文件丢失时在该轮恢复，连接失败直接重建，不连续重复测活；恢复或上报失败留到下一小时重试，不再探测已判定失效的旧域名。
-
-已有核心可运行就继续使用，缺失或无法运行时重新下载并校验；恢复保留原 UUID、端口和路径。systemd 三个服务和 OpenRC 的失败自动拉起间隔也统一为 1 小时。普通用户与容器需由进程管理器或容器策略保持守护运行，外部策略的重启周期由你设置。
-
-日志整理仍每 30 秒执行，以限制磁盘占用；它不触发连接检查或重建。取得新域名后刷新客户端订阅。
-
-Worker 不判断服务器是否在线，也不会自动删除离线记录。Quick Tunnel 没有可用性保证，长期使用建议固定隧道。
-
-## 卸载与排障
+## 6. 卸载与排障
 
 按实际安装路径选择命令，设置页也提供对应复制按钮：
 
@@ -182,8 +192,14 @@ Worker 不判断服务器是否在线，也不会自动删除离线记录。Quic
 "$HOME/.local/share/tunel/bin/tunel" uninstall -y
 ```
 
-自定义目录使用其 `bin/tunel uninstall -y`。注销失败不会阻止本地清理，此时到记录页手动删除；永久下线的服务器也需手动移除。
+自定义目录使用其 `bin/tunel uninstall -y`。卸载后检查「记录」页，仍有对应记录时手动删除。
 
-安装失败先阅读终端显示的原因和日志路径；缺依赖先预装，目录错误改为可写的专用目录。申请临时域名出现 HTTP 429 表示限流，保持守护运行并等待下一小时重试；Cloudflare 何时解除限流由其服务决定。上报 401 时核对 REPORT_TOKEN；管理功能报配置错误时核对 KV、两个 secrets 与部署环境。
+| 问题 | 处理方法 |
+| --- | --- |
+| 缺少依赖或目录不可写 | 补齐依赖，或设置可写的专用 `TUNEL_HOME` 后重新安装 |
+| 未取得临时域名 | 查看 `tunel agent log`，确认守护已启动；使用了 `--no-agent` 时执行 `tunel agent start` |
+| 申请临时域名返回 HTTP 429 | 保持守护运行，至少等待 1 小时后再试 |
+| 上报返回 401 | 核对安装参数中的 `REPORT_TOKEN` 与 Worker secret 是否一致 |
+| 面板提示配置错误 | 核对 `TUNEL_KV`、两个 secrets 及当前部署环境 |
 
-订阅地址与安装命令含凭据，请妥善保管。第三方 SUBAPI 可读取节点明文，需要时改用可信或自建转换服务。核心版本及上游来源见 [vendor/README.md](vendor/README.md)。
+订阅地址和安装命令包含凭据，不要公开。`SUBAPI` 请使用可信或自建转换服务。核心版本及来源见 [vendor/README.md](vendor/README.md)。

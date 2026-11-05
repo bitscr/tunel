@@ -1,6 +1,13 @@
 const VERSION = '0.0.1';
 const DEFAULT_SUBAPI = 'https://clawsub.7979.pp.ua';
 const DEFAULT_SUBCONFIG = 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/config/ACL4SSR_Online_Mini_MultiMode.ini';
+// cmliu/edgetunnel 优选订阅协议；UA 版本独立于本项目 VERSION。
+const PREFERRED_VERSION = '2026-10-08 22:23:27';
+const PREFERRED_UUID = '00000000-0000-4000-8000-000000000000';
+const PREFERRED_HOST = 'example.com';
+const SUBSCRIPTION_UA = 'edge' + 'tunnel (https://github.com/' +
+  (String.fromCharCode(67, 109) + URL.name[2] + 'i' + URL.name[0]).toLowerCase() +
+  '/edge' + 'tunnel) Uid/0x000000 Version/' + Number(PREFERRED_VERSION.replace(/\D+/g, ''));
 const SECURITY_HEADERS = Object.freeze({ 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' });
 const NGINX_WELCOME_HTML = `<!DOCTYPE html>
 <html>
@@ -110,6 +117,130 @@ function parseCfip(value, status = 500) {
   });
 }
 
+function parsePreferredSubscriber(value, status = 500) {
+  const text = value.trim();
+  if (!text) {
+    return '';
+  }
+  try {
+    if (text.length > 2048 || /\s/.test(text)) {
+      throw new Error('invalid subscriber');
+    }
+    const normalized = text.replace(/^sub:\/\//i, 'https://');
+    const url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(normalized) ? normalized : `https://${normalized}`);
+    if (!/^https?:$/.test(url.protocol) || !url.hostname || url.username || url.password) {
+      throw new Error('invalid subscriber');
+    }
+    if (url.pathname === '/') {
+      url.pathname = '/sub';
+    }
+    url.hash = '';
+    return url.href;
+  } catch {
+    throw new HttpError(status, '优选订阅器地址无效，请填写域名或 HTTP(S) 订阅 URL');
+  }
+}
+
+function nodeAddress(node) {
+  if (!node || typeof node !== 'object' || Array.isArray(node) || typeof node.add !== 'string' || !node.add) {
+    throw new Error('invalid vmess object');
+  }
+  const host = node.add.includes(':') && !node.add.startsWith('[') ? `[${node.add}]` : node.add;
+  return parseCfip(`${host}:${node.port ?? 443}`)[0];
+}
+
+function parsePreferredAddresses(content) {
+  let text = content.trim();
+  if (!text.includes('://')) {
+    try {
+      text = decodeBase64(text);
+    } catch {
+    }
+  }
+  const addresses = [];
+  const seen = new Set();
+  for (const line of text.split(/\r?\n/).map(value => value.trim()).filter(Boolean)) {
+    try {
+      let address;
+      if (line.startsWith('vmess://')) {
+        const node = JSON.parse(decodeBase64(line.slice('vmess://'.length)));
+        if (node.id !== PREFERRED_UUID || ![node.host, node.sni].includes(PREFERRED_HOST)) {
+          continue;
+        }
+        address = nodeAddress(node);
+      } else if (/^(vless|trojan):\/\//i.test(line)) {
+        const node = new URL(line);
+        if (decodeURIComponent(node.username) !== PREFERRED_UUID || ![node.searchParams.get('host'), node.searchParams.get('sni')].includes(PREFERRED_HOST)) {
+          continue;
+        }
+        address = parseCfip(`${node.hostname}:${node.port || 443}`)[0];
+      } else if (!line.includes('://')) {
+        address = parseCfip(line.split('#')[0])[0];
+        if (!address || !/[.:]/.test(address.host)) {
+          continue;
+        }
+      } else {
+        continue;
+      }
+      if (['0.0.0.0', '127.0.0.1', '::', '::1'].includes(address.host)) {
+        continue;
+      }
+      const key = `${address.host.toLowerCase()}:${address.port}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        addresses.push(address);
+      }
+    } catch {
+    }
+  }
+  return addresses;
+}
+
+async function fetchPreferredAddresses(subscriber) {
+  if (!subscriber) {
+    return [];
+  }
+  try {
+    const url = new URL('/sub', subscriber);
+    url.searchParams.set('host', PREFERRED_HOST);
+    url.searchParams.set('uuid', PREFERRED_UUID);
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'v2rayN/' + SUBSCRIPTION_UA },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok || Number(response.headers.get('Content-Length')) > 1048576) {
+      await response.body?.cancel();
+      return [];
+    }
+    const reader = response.body?.getReader();
+    if (!reader) {
+      return [];
+    }
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    let size = 0;
+    let content = '';
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        size += value.byteLength;
+        if (size > 1048576) {
+          await reader.cancel();
+          return [];
+        }
+        content += decoder.decode(value, { stream: true });
+      }
+      return parsePreferredAddresses(content + decoder.decode());
+    } finally {
+      reader.releaseLock();
+    }
+  } catch {
+    return [];
+  }
+}
+
 function readConfig(env) {
   if (!env.ADMIN_TOKEN || !env.REPORT_TOKEN) {
     throw new HttpError(500, 'ADMIN_TOKEN/REPORT_TOKEN 未配置');
@@ -125,6 +256,7 @@ function readConfig(env) {
     subconfig: String(env.SUBCONFIG || DEFAULT_SUBCONFIG).trim(),
     subname: String(env.SUBNAME || 'tunel'),
     initialCfip: String(env.CFIP ?? ''),
+    initialPreferredSubscriber: String(env.SUB ?? ''),
     initialUpstream: splitVariable(env.UPSTREAM),
   };
 }
@@ -502,29 +634,35 @@ async function saveSources(request, config, now, cache, origin) {
 
 async function readSettings(config) {
   const raw = await config.kv.get('settings');
+  const invalid = validationError => ({ cfip: '', preferredSubscriber: '', source: 'settings', preferredSubscriberSource: 'settings', updatedAt: 0, valid: false, validationError });
   let stored;
   if (raw !== null && raw !== undefined) {
     if (typeof raw !== 'string' || new TextEncoder().encode(raw).byteLength > 8192) {
-      return { cfip: '', source: 'settings', updatedAt: 0, valid: false, validationError: 'CFIP 设置数据超过 8KB 或格式无效，请重新保存' };
+      return invalid('连接地址设置数据超过 8KB 或格式无效，请重新保存');
     }
     try {
       stored = JSON.parse(raw);
     } catch {
-      return { cfip: '', source: 'settings', updatedAt: 0, valid: false, validationError: 'CFIP 设置数据无效，请重新保存' };
+      return invalid('连接地址设置数据无效，请重新保存');
     }
-    if (!stored || typeof stored.cfip !== 'string') {
-      return { cfip: '', source: 'settings', updatedAt: 0, valid: false, validationError: 'CFIP 设置数据无效，请重新保存' };
+    if (!stored || typeof stored.cfip !== 'string' || (stored.preferredSubscriber !== undefined && typeof stored.preferredSubscriber !== 'string')) {
+      return invalid('连接地址设置数据无效，请重新保存');
     }
   }
   const cfip = splitVariable(stored ? stored.cfip : config.initialCfip).join('\n');
-  const settings = { cfip, source: stored ? 'settings' : 'env', updatedAt: stored?.updatedAt ?? 0, valid: true };
+  const savedSubscriber = stored && Object.hasOwn(stored, 'preferredSubscriber');
+  const settings = {
+    cfip, preferredSubscriber: savedSubscriber ? stored.preferredSubscriber : config.initialPreferredSubscriber,
+    source: stored ? 'settings' : 'env', preferredSubscriberSource: savedSubscriber ? 'settings' : 'env', updatedAt: stored?.updatedAt ?? 0, valid: true,
+  };
   try {
     if (new TextEncoder().encode(cfip).byteLength > 8192) {
       throw new HttpError(500, 'CFIP 配置超过 8KB');
     }
     parseCfip(cfip);
+    settings.preferredSubscriber = parsePreferredSubscriber(settings.preferredSubscriber);
   } catch (error) {
-    return { ...settings, valid: false, validationError: error instanceof HttpError ? error.message : 'CFIP 配置无效' };
+    return { ...settings, valid: false, validationError: error instanceof HttpError ? error.message : '连接地址配置无效' };
   }
   return settings;
 }
@@ -534,10 +672,15 @@ async function saveSettings(request, config, now) {
   if (typeof payload.cfip !== 'string') {
     throw new HttpError(400, 'cfip 必须是字符串');
   }
+  if (payload.preferredSubscriber !== undefined && typeof payload.preferredSubscriber !== 'string') {
+    throw new HttpError(400, 'preferredSubscriber 必须是字符串');
+  }
   const cfip = parseCfip(payload.cfip, 400).map(address => address.label).join('\n');
-  const next = { cfip, updatedAt: now };
+  const current = await readSettings(config);
+  const preferredSubscriber = parsePreferredSubscriber(payload.preferredSubscriber ?? current.preferredSubscriber, 400);
+  const next = { cfip, preferredSubscriber, updatedAt: now };
   if (new TextEncoder().encode(JSON.stringify(next)).byteLength > 8192) {
-    throw new HttpError(413, 'CFIP 配置超过 8KB');
+    throw new HttpError(413, '连接地址配置超过 8KB');
   }
   const raw = await config.kv.get('settings');
   let old;
@@ -547,67 +690,104 @@ async function saveSettings(request, config, now) {
     } catch {
     }
   }
-  if (old && old.cfip === cfip) {
-    return json({ cfip, source: 'settings', updatedAt: old.updatedAt ?? 0, valid: true, skipped: true });
+  if (old && old.cfip === cfip && old.preferredSubscriber === preferredSubscriber) {
+    return json({ cfip, preferredSubscriber, source: 'settings', preferredSubscriberSource: 'settings', updatedAt: old.updatedAt ?? 0, valid: true, skipped: true });
   }
   await config.kv.put('settings', JSON.stringify(next));
-  return json({ cfip, source: 'settings', updatedAt: now, valid: true });
+  return json({ cfip, preferredSubscriber, source: 'settings', preferredSubscriberSource: 'settings', updatedAt: now, valid: true });
 }
 
-async function effectiveConfig(config) {
+async function addressConfig(config, cfip, preferredCfip = []) {
+  const pairs = addresses => addresses.map(address => [address.host, address.port]);
+  const bytes = new TextEncoder().encode(JSON.stringify(['sequential-v1', pairs(cfip), pairs(preferredCfip)]));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const cfipCacheTag = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  return { ...config, cfip, preferredCfip, cfipCacheTag };
+}
+
+async function effectiveConfig(config, fetchPreferred = false) {
   const settings = await readSettings(config);
   if (!settings.valid) {
     throw new HttpError(500, settings.validationError);
   }
   const cfip = parseCfip(settings.cfip);
-  const bytes = new TextEncoder().encode(JSON.stringify(cfip.map(address => [address.host, address.port])));
-  const digest = await crypto.subtle.digest('SHA-256', bytes);
-  const cfipCacheTag = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
-  return { ...config, cfip, cfipCacheTag };
+  const preferredCfip = fetchPreferred ? await fetchPreferredAddresses(settings.preferredSubscriber) : [];
+  return await addressConfig({ ...config, preferredSubscriber: settings.preferredSubscriber, dynamicAddresses: Boolean(settings.preferredSubscriber) }, cfip, preferredCfip);
+}
+
+function rawAddressSnapshot(content) {
+  const addresses = [];
+  for (const link of decodeBase64(content).split(/\r?\n/)) {
+    if (link.startsWith('vmess://')) {
+      try {
+        const address = nodeAddress(JSON.parse(decodeBase64(link.slice('vmess://'.length))));
+        addresses.push([address.host, address.port]);
+      } catch {
+      }
+    }
+  }
+  const snapshot = encodeBase64(JSON.stringify(addresses));
+  if (snapshot.length > 65536) {
+    throw new Error('address snapshot too large');
+  }
+  return snapshot;
+}
+
+async function snapshotConfig(config, snapshot) {
+  try {
+    const pairs = JSON.parse(decodeBase64(snapshot));
+    if (!Array.isArray(pairs) || pairs.some(pair => !Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== 'string' || !Number.isInteger(pair[1]))) {
+      throw new Error('invalid address snapshot');
+    }
+    const addresses = pairs.map(([add, port]) => nodeAddress({ add, port }));
+    return await addressConfig({ ...config, dynamicAddresses: true }, [], addresses);
+  } catch {
+    throw new HttpError(400, '连接地址快照无效');
+  }
 }
 
 function utcDate(timestamp) {
   return new Date(timestamp).toISOString().slice(0, 10).replace(/-/g, '');
 }
 
-async function deriveRawToken(reportToken, date) {
+async function deriveRawToken(reportToken, date, snapshot = '') {
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey('raw', encoder.encode(reportToken), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(`raw:${date}`));
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(snapshot ? `raw:${date}:addresses:${snapshot}` : `raw:${date}`));
   return Array.from(new Uint8Array(signature), byte => byte.toString(16).padStart(2, '0')).join('').slice(0, 16);
 }
 
-async function authorizeRaw(token, config, timestamp) {
-  const today = await deriveRawToken(config.reportToken, utcDate(timestamp));
-  const yesterday = await deriveRawToken(config.reportToken, utcDate(timestamp - 86400000));
+async function authorizeRaw(token, config, timestamp, snapshot = '') {
+  const today = await deriveRawToken(config.reportToken, utcDate(timestamp), snapshot);
+  const yesterday = await deriveRawToken(config.reportToken, utcDate(timestamp - 86400000), snapshot);
   const currentMatch = equalToken(token, today);
   const previousMatch = equalToken(token, yesterday);
   return currentMatch || previousMatch;
 }
 
-function expandLinks(links, cfip) {
-  if (!cfip.length) {
+function applyAddresses(links, cfip, preferredCfip = []) {
+  if (!cfip.length && !preferredCfip.length) {
     return uniqueLines(links);
   }
-  const expanded = [];
+  const assigned = [];
+  let index = 0;
   for (const link of links) {
     if (!link.startsWith('vmess://')) {
-      expanded.push(link);
+      assigned.push(link);
       continue;
     }
     try {
       const node = JSON.parse(decodeBase64(link.slice('vmess://'.length)));
-      if (!node || typeof node !== 'object' || Array.isArray(node)) {
-        throw new Error('invalid vmess object');
-      }
-      for (const address of cfip) {
-        expanded.push(`vmess://${encodeBase64(JSON.stringify({ ...node, add: address.host, port: address.port }))}`);
-      }
+      const originalAddress = nodeAddress(node);
+      const address = preferredCfip[index] ?? (cfip.length ? cfip[(index - preferredCfip.length) % cfip.length] : undefined);
+      const changedAddress = address && (address.host !== originalAddress.host || address.port !== originalAddress.port);
+      index += 1;
+      assigned.push(changedAddress ? `vmess://${encodeBase64(JSON.stringify({ ...node, add: address.host, port: address.port }))}` : link);
     } catch {
-      expanded.push(link);
+      assigned.push(link);
     }
   }
-  return uniqueLines(expanded);
+  return uniqueLines(assigned);
 }
 
 async function cachedResponse(cache, key) {
@@ -644,6 +824,9 @@ async function purgeCache(cache, origin, config) {
 }
 
 async function rawContent(config, origin, cache) {
+  if (config.dynamicAddresses) {
+    cache = undefined;
+  }
   const key = `${origin}/raw?cfip=${config.cfipCacheTag}`;
   const cached = await cachedResponse(cache, key);
   if (cached) {
@@ -652,7 +835,7 @@ async function rawContent(config, origin, cache) {
   const nodes = await readNodes(config.kv);
   const sources = await readSources(config);
   const links = uniqueLines([...nodes.map(node => node.link).filter(link => typeof link === 'string'), ...sources.links]);
-  const content = encodeBase64(expandLinks(links, config.cfip).join('\n'));
+  const content = encodeBase64(applyAddresses(links, config.cfip, config.preferredCfip).join('\n'));
   await storeResponse(cache, key, content);
   return content;
 }
@@ -703,7 +886,7 @@ function conversionUrl(config, format, sources) {
 }
 
 function subscriptionHeaders(request, config, fallback) {
-  const headers = { 'Profile-Update-Interval': '6', 'Cache-Control': 'private, max-age=60' };
+  const headers = { 'Profile-Update-Interval': '6', 'Cache-Control': config.dynamicAddresses ? 'no-store' : 'private, max-age=60' };
   if (!(request.headers.get('User-Agent') ?? '').toLowerCase().includes('mozilla')) {
     const filename = encodeURIComponent(config.subname).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
     headers['Content-Disposition'] = `attachment; filename*=utf-8''${filename}`;
@@ -715,6 +898,9 @@ function subscriptionHeaders(request, config, fallback) {
 }
 
 async function subscription(request, url, config, timestamp, cache) {
+  if (config.dynamicAddresses) {
+    cache = undefined;
+  }
   const format = subscriptionFormat(request, url);
   const key = `${url.origin}/sub?fmt=${format}&cfip=${config.cfipCacheTag}`;
   const cached = await cachedResponse(cache, key);
@@ -727,10 +913,18 @@ async function subscription(request, url, config, timestamp, cache) {
   let fallback = false;
   if (format !== 'base64' || sources.upstream.length) {
     try {
-      const token = await deriveRawToken(config.reportToken, utcDate(timestamp));
-      const rawUrl = `${url.origin}/raw?t=${token}`;
-      const backend = conversionUrl(config, format, [rawUrl, ...sources.upstream]);
-      const response = await fetch(backend, { headers: { 'User-Agent': request.headers.get('User-Agent') || 'tunel' }, signal: AbortSignal.timeout(12000) });
+      const snapshot = config.dynamicAddresses ? rawAddressSnapshot(local) : '';
+      const token = await deriveRawToken(config.reportToken, utcDate(timestamp), snapshot);
+      const rawUrl = new URL('/raw', url.origin);
+      rawUrl.searchParams.set('t', token);
+      if (snapshot) {
+        rawUrl.searchParams.set('addresses', snapshot);
+      }
+      const backend = conversionUrl(config, format, [rawUrl.href, ...sources.upstream]);
+      const response = await fetch(backend, {
+        headers: { 'User-Agent': 'Subconverter for ' + backend.searchParams.get('target') + ' ' + SUBSCRIPTION_UA },
+        signal: AbortSignal.timeout(12000),
+      });
       if (!response.ok) {
         await response.body?.cancel();
         throw new Error('subconverter response failed');
@@ -780,7 +974,9 @@ function panel(config, credential, pathCredential) {
 <section id="nodes" class="panel" role="tabpanel" aria-labelledby="tab-nodes"><h2>记录列表</h2><div id="node-table" class="table-wrap"><p class="empty">正在读取记录…</p></div></section>
 <section id="sources" class="panel" role="tabpanel" aria-labelledby="tab-sources" hidden><h2>数据源</h2><label for="links">手工链接</label><textarea id="links" spellcheck="false" placeholder="一行一个链接"></textarea><small>支持包含 :// 的链接，保存时自动去除空行与重复项。</small><label for="upstream">远程数据 URL</label><textarea id="upstream" spellcheck="false" placeholder="一行一个 https:// 或 http:// URL"></textarea><div class="footer-actions"><button id="save-sources" class="primary">保存</button></div></section>
 <section id="subscriptions" class="panel" role="tabpanel" aria-labelledby="tab-subscriptions" hidden><h2>访问链接</h2><p>这些地址包含访问凭据，请妥善保管。</p><div id="subscription-list"></div></section>
-<section id="settings" class="panel" role="tabpanel" aria-labelledby="tab-settings" hidden><h2>设置</h2><dl><div class="setting"><dt>处理服务</dt><dd id="subapi"></dd></div><div class="setting"><dt>配置地址</dt><dd id="subconfig"></dd></div><div class="setting"><dt>接收地址</dt><dd id="report-endpoint"></dd></div></dl><label for="cfip">CFIP 连接地址</label><textarea id="cfip" spellcheck="false" placeholder="一行一个 IP:端口或域名，例如 162.159.1.1:443 或 cf.example.com"></textarea><small>支持换行或逗号分隔，端口省略时为 443；IPv6 指定端口请使用 [IPv6]:端口。保存空内容会关闭自定义地址，使用原始地址。</small><small id="cfip-source"></small><p id="cfip-error" class="danger" hidden></p><div class="footer-actions"><button id="save-cfip" class="primary" disabled>保存 CFIP</button></div><label for="report-token">REPORT_TOKEN</label><input id="report-token" type="text" readonly autocomplete="off" spellcheck="false"><div class="footer-actions"><button id="copy-report-token">复制凭据</button></div><p>此凭据用于服务器同步，请妥善保管。</p><label for="install-command">一键安装并启动服务</label><textarea id="install-command" readonly spellcheck="false"></textarea><div class="footer-actions"><button id="copy-install">复制命令</button></div><p>安装命令已包含同步凭据，复制后可在服务器执行。</p>
+<section id="settings" class="panel" role="tabpanel" aria-labelledby="tab-settings" hidden><h2>设置</h2><dl><div class="setting"><dt>处理服务</dt><dd id="subapi"></dd></div><div class="setting"><dt>配置地址</dt><dd id="subconfig"></dd></div><div class="setting"><dt>接收地址</dt><dd id="report-endpoint"></dd></div></dl>
+<label for="preferred-subscriber">优选订阅器</label><input id="preferred-subscriber" type="text" autocomplete="off" spellcheck="false" placeholder="best.example.com 或 https://best.example.com/sub"><small>按官方协议请求该域名下的 /sub，忽略所填 URL 的路径与参数。每次订阅请求重新获取地址，每个 VMess 节点分配一个地址：先依次使用订阅器地址，耗尽后使用下方 CFIP 列表。保存空内容会关闭订阅器。</small><small id="preferred-subscriber-source"></small>
+<label for="cfip">CFIP 优选域名 / IP</label><textarea id="cfip" spellcheck="false" placeholder="一行一个 IP:端口或域名，例如 162.159.1.1:443 或 cf.example.com"></textarea><small>支持换行或逗号分隔，端口省略时为 443；IPv6 指定端口请使用 [IPv6]:端口。CFIP 列表用完会循环使用；列表为空时，剩余节点使用原始地址。</small><small id="cfip-source"></small><p id="cfip-error" class="danger" hidden></p><div class="footer-actions"><button id="save-cfip" class="primary" disabled>保存连接设置</button></div><label for="report-token">REPORT_TOKEN</label><input id="report-token" type="text" readonly autocomplete="off" spellcheck="false"><div class="footer-actions"><button id="copy-report-token">复制凭据</button></div><p>此凭据用于服务器同步，请妥善保管。</p><label for="install-command">一键安装并启动服务</label><textarea id="install-command" readonly spellcheck="false"></textarea><div class="footer-actions"><button id="copy-install">复制命令</button></div><p>安装命令已包含同步凭据，复制后可在服务器执行。</p>
 <label for="uninstall-system-command">系统目录卸载</label><input id="uninstall-system-command" type="text" readonly autocomplete="off" spellcheck="false" value="/usr/local/bin/tunel uninstall -y"><div class="footer-actions"><button id="copy-uninstall-system">复制卸载命令</button></div>
 <label for="uninstall-user-command">用户目录卸载</label><input id="uninstall-user-command" type="text" readonly autocomplete="off" spellcheck="false" value="&quot;$HOME/.local/share/tunel/bin/tunel&quot; uninstall -y"><div class="footer-actions"><button id="copy-uninstall-user">复制卸载命令</button></div><small>按安装时输出的目录选择，并使用安装时的账户执行。自定义目录请调用其 bin/tunel。卸载会读取本机配置注销记录并清理服务。</small>
 <p>记录在服务器同步变化时更新；服务器停止运行后不会自动移除记录，需在「记录」页手动删除或在服务器执行卸载命令。</p></section>
@@ -908,9 +1104,11 @@ function renderInstallCommand() {
 function renderSettings(status) {
   for (const name of ['subapi', 'subconfig']) { document.getElementById(name).textContent = status[name]; }
 }
-function renderCfipSettings(settings) {
+function renderAddressSettings(settings) {
   document.getElementById('cfip').value = settings.cfip;
-  document.getElementById('cfip-source').textContent = settings.source === 'env' ? '当前使用 Worker 的 CFIP 变量；保存后由面板配置覆盖。' : settings.cfip ? '当前使用面板保存的连接地址。' : '自定义地址已关闭，使用原始地址。';
+  document.getElementById('preferred-subscriber').value = settings.preferredSubscriber;
+  document.getElementById('preferred-subscriber-source').textContent = settings.preferredSubscriberSource === 'env' ? '当前使用 Worker 的 SUB 变量；保存后由面板配置覆盖。' : settings.preferredSubscriber ? '当前使用面板保存的优选订阅器。' : '优选订阅器已关闭，依次使用 CFIP 列表。';
+  document.getElementById('cfip-source').textContent = settings.source === 'env' ? '当前使用 Worker 的 CFIP 变量；保存后由面板配置覆盖。' : settings.cfip ? '当前使用面板保存的连接地址。' : 'CFIP 列表为空，优选订阅器地址耗尽后使用原始地址。';
   const error = document.getElementById('cfip-error');
   error.textContent = settings.validationError || '';
   error.hidden = !settings.validationError;
@@ -920,7 +1118,7 @@ async function refresh() {
   const button = document.getElementById('refresh'); button.disabled = true;
   try {
     const settingsRequest = api('/api/settings').then(settings => {
-      renderCfipSettings(settings);
+      renderAddressSettings(settings);
       return settings;
     }, failure => {
       const error = document.getElementById('cfip-error'); error.textContent = failure.message; error.hidden = false;
@@ -972,9 +1170,9 @@ document.getElementById('copy-report-token').addEventListener('click', event => 
 document.getElementById('save-cfip').addEventListener('click', async event => {
   const button = event.currentTarget; button.disabled = true;
   try {
-    const settings = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ cfip: document.getElementById('cfip').value }) });
-    renderCfipSettings(settings);
-    notify('CFIP 已保存，后续输出将使用新配置；KV 跨区同步可能需要约 60 秒。');
+    const settings = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ cfip: document.getElementById('cfip').value, preferredSubscriber: document.getElementById('preferred-subscriber').value }) });
+    renderAddressSettings(settings);
+    notify('连接设置已保存，后续订阅请求将使用新配置；KV 跨区同步可能需要约 60 秒。');
   } catch (error) {
     const message = document.getElementById('cfip-error'); message.textContent = error.message; message.hidden = false;
     notify(error.message, true);
@@ -1070,10 +1268,15 @@ async function handleRequest(request, env) {
   }
   if (path === '/raw') {
     requireMethod(request, ['GET', 'HEAD']);
-    if (!await authorizeRaw(url.searchParams.get('t') ?? '', config, timestamp)) {
+    const snapshot = url.searchParams.get('addresses') ?? '';
+    if (snapshot.length > 65536) {
+      throw new HttpError(400, '连接地址快照过大');
+    }
+    if (!await authorizeRaw(url.searchParams.get('t') ?? '', config, timestamp, snapshot)) {
       throw new HttpError(401, '只读鉴权失败');
     }
-    return plain(await rawContent(await effectiveConfig(config), url.origin, cache), 200, { 'Cache-Control': 'no-store' });
+    const resolvedConfig = snapshot ? await snapshotConfig(config, snapshot) : await effectiveConfig(config, true);
+    return plain(await rawContent(resolvedConfig, url.origin, cache), 200, { 'Cache-Control': 'no-store' });
   }
   const adminMethods = { '/api/nodes': ['GET'], '/api/node': ['DELETE'], '/api/sources': ['GET', 'PUT'], '/api/settings': ['GET', 'PUT'], '/api/status': ['GET'], '/sub': ['GET', 'HEAD'] };
   if (!Object.hasOwn(adminMethods, path)) {
@@ -1112,9 +1315,9 @@ async function handleRequest(request, env) {
     const includeCounts = url.searchParams.get('counts') !== '0';
     const nodeCount = includeCounts ? (await listNodeKeys(config.kv)).length : undefined;
     const sources = includeCounts ? await readSources(config) : undefined;
-    return json({ version: VERSION, subapi: config.subapi, subconfig: config.subconfig, cfip, ...(includeCounts ? { nodeCount, sourceCount: sources.links.length + sources.upstream.length } : {}), ...(!settings.valid ? { cfipValidationError: settings.validationError } : {}) });
+    return json({ version: VERSION, subapi: config.subapi, subconfig: config.subconfig, cfip, preferredSubscriber: settings.preferredSubscriber, ...(includeCounts ? { nodeCount, sourceCount: sources.links.length + sources.upstream.length } : {}), ...(!settings.valid ? { cfipValidationError: settings.validationError } : {}) });
   }
-  return await subscription(request, url, await effectiveConfig(config), timestamp, cache);
+  return await subscription(request, url, await effectiveConfig(config, true), timestamp, cache);
 }
 
 export default {

@@ -1715,6 +1715,10 @@ location_select_route() {
         if [ -z "$routes" ] && [ "$family" = 4 ] && [ -r /proc/net/route ]; then
             routes=$(awk 'NR>1 && $2=="00000000" && $8=="00000000" && $4 ~ /[13579bBdDfF]$/ {print $7,$1,"-"}' /proc/net/route | sort -sn)
         fi
+        if [ -z "$routes" ] && [ "$family" = 6 ] && [ -r /proc/net/ipv6_route ]; then
+            # IPv6-only 精简容器可能没有 ip；proc 的定长十六进制 metric 按字典序排序。
+            routes=$(awk '$1=="00000000000000000000000000000000" && $2=="00" && $9 ~ /[13579bBdDfF]$/ {print $6,$10,"-"}' /proc/net/ipv6_route | sort -s)
+        fi
         while read -r key device preferred; do
             location_interface_valid "$device" || continue
             if [ -z "$fallback_device" ]; then fallback_device=$device; fallback_family=$family; fi
@@ -1941,9 +1945,9 @@ location_refresh() {
                 location_verify_response "$response" query || continue
                 location_parse "$response" countryCode region regionName success || continue ;;
             worker)
-                [ "$LOCATION_QUERY_MODE" = interface ] || continue
                 [ -n "$REPORT_URL" ] && [ -n "$REPORT_TOKEN" ] || continue
-                response=$(location_fetch "${REPORT_URL%/api/report}/api/location" -H "Authorization: Bearer $REPORT_TOKEN") || continue
+                # Worker 绑定原生接口请求；公网 IP 模式在外层继续核对响应 IP，避免 WARP 误定位。
+                response=$(LOCATION_QUERY_MODE=interface location_fetch "${REPORT_URL%/api/report}/api/location" -H "Authorization: Bearer $REPORT_TOKEN") || continue
                 location_verify_response "$response" ip || continue
                 location_parse "$response" country region regionName || continue ;;
         esac
@@ -1953,6 +1957,11 @@ location_refresh() {
     [ "${STOP:-0}" != 1 ] || return 0
     now=$(date +%s)
     if [ -z "$source" ]; then
+        if [ "$route_ok" = 1 ]; then
+            agent_log WARN "国家/地区识别失败：接口 $LOCATION_QUERY_INTERFACE（IPv$LOCATION_QUERY_FAMILY，$LOCATION_QUERY_MODE 模式）的查询未取得可验证位置"
+        else
+            agent_log WARN "国家/地区识别失败：未找到可用的原生 IPv4/IPv6 默认接口"
+        fi
         location_cache_save "${COUNTRY:-}" "${REGION:-}" "${REGION_NAME:-}" "${LOCATION_TS:-0}" "${LOCATION_SOURCE:-}" "$now" "${LOCATION_IP:-}" "${LOCATION_INTERFACE:-}" "${LOCATION_METHOD:-}" "$reset" || return 0
         LOCATION_ATTEMPT_TS=$now; LOCATION_POLICY=native-v1; LOCATION_NEEDS_REPORT=0
         [ "$reset" != 1 ] || LAST_REPORTED_DOMAIN=""
