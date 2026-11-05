@@ -200,6 +200,9 @@ curl -fsSL https://raw.githubusercontent.com/bitscr/tunel/main/tunel.sh | TUNEL_
 | 未取得临时域名 | 查看 `tunel agent log`，确认守护已启动；使用了 `--no-agent` 时执行 `tunel agent start` |
 | 申请临时域名返回 HTTP 429 | 保持守护运行，至少等待 1 小时后再试 |
 | 上报返回 401 | 核对安装参数中的 `REPORT_TOKEN` 与 Worker secret 是否一致 |
+| 国家/地区未识别 | 查看 `tunel agent log`；私网/ULA 先绑定原生默认接口取得公网出口 IP，再按该 IP 查询位置；IPv4 失败后尝试 IPv6，仍拒绝 WARP 位置 |
 | 面板提示配置错误 | 核对 `TUNEL_KV`、两个 secrets 及当前部署环境 |
+
+位置识别支持 IPv4 单栈、IPv6 单栈和双栈；没有 `ip` 命令时读取 `/proc` 默认路由。沿用 Linux/Bash、curl、awk 等原有依赖，不新增 jq/Python。IPify 不可用时仍会尝试原有位置接口；全部查询失败时保留已验证缓存或显示未识别，不阻断隧道运行。
 
 订阅地址和安装命令包含凭据，不要公开。`SUBAPI` 请使用可信或自建转换服务。核心版本及来源见 [vendor/README.md](vendor/README.md)。

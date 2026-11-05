@@ -1706,6 +1706,7 @@ location_interface_valid() {
 location_select_route() {
     local family routes device address key preferred fallback_device="" fallback_family=""
     LOCATION_QUERY_MODE=""; LOCATION_QUERY_IP=""; LOCATION_QUERY_INTERFACE=""; LOCATION_QUERY_FAMILY=""
+    LOCATION_QUERY_IPV6_INTERFACE=""
     for family in 4 6; do
         routes=""
         if has ip; then
@@ -1722,6 +1723,7 @@ location_select_route() {
         while read -r key device preferred; do
             location_interface_valid "$device" || continue
             if [ -z "$fallback_device" ]; then fallback_device=$device; fallback_family=$family; fi
+            [ "$family" != 6 ] || LOCATION_QUERY_IPV6_INTERFACE=$device
             if has ip; then
                 while read -r address; do
                     key=$(location_ip_key "$address") || continue
@@ -1844,7 +1846,7 @@ location_parse() {
         [ "$status" = success ] || return 1
     fi
     country=$(printf '%s' "$response" | location_json_string "$2" | LC_ALL=C tr '[:lower:]' '[:upper:]')
-    location_country_valid "$country" || return 1
+    location_country_valid "$country" || { agent_log WARN "位置响应缺少有效国家代码" >&2; return 1; }
     [ -z "$3" ] || region=$(printf '%s' "$response" | location_json_string "$3")
     [[ "$region" =~ ^[A-Za-z0-9_-]{1,16}$ ]] || region=""
     [ -z "$4" ] || name=$(printf '%s' "$response" | location_json_string "$4")
@@ -1871,9 +1873,12 @@ location_cache_save() {
 
 location_verify_response() {
     local response=$1 value key owners="" asn field known=0
-    value=$(printf '%s' "$response" | location_json_string "$2") || return 1
-    key=$(location_ip_key "$value") || return 1
-    if [ "$LOCATION_QUERY_MODE" = ip ] && [ "$key" != "$LOCATION_QUERY_IP" ]; then return 1; fi
+    value=$(printf '%s' "$response" | location_json_string "$2") || { agent_log WARN "位置响应缺少 $2 地址字段" >&2; return 1; }
+    key=$(location_ip_key "$value") || { agent_log WARN "位置响应不是有效公网 IP：$value" >&2; return 1; }
+    if [ "$LOCATION_QUERY_MODE" = ip ] && [ "$key" != "$LOCATION_QUERY_IP" ]; then
+        agent_log WARN "位置响应 IP 不匹配：查询 $LOCATION_QUERY_IP，返回 $key" >&2
+        return 1
+    fi
     asn=$(printf '%s' "$response" | location_json_string asn 1)
     if [[ "$asn" =~ ^[0-9]{1,10}$ ]] && [ "$((10#$asn))" -gt 0 ] && [ "$((10#$asn))" -le 4294967295 ]; then known=1; fi
     for field in org as isp organization asn_organization; do
@@ -1883,8 +1888,11 @@ location_verify_response() {
     done
     if [[ "$owners" =~ [Cc][Ll][Oo][Uu][Dd][Ff][Ll][Aa][Rr][Ee] ]] ||
         [[ "$asn" =~ (^|[^0-9])13335([^0-9]|$) ]] ||
-        [[ "$owners" =~ [Aa][Ss][[:space:]]*13335([^0-9]|$) ]]; then return 1; fi
-    [ "$known" = 1 ] || return 1
+        [[ "$owners" =~ [Aa][Ss][[:space:]]*13335([^0-9]|$) ]]; then
+        agent_log WARN "位置响应来自 Cloudflare/WARP 出口，不用于原生位置" >&2
+        return 1
+    fi
+    [ "$known" = 1 ] || { agent_log WARN "位置响应缺少可验证的 ASN/运营商信息" >&2; return 1; }
     LOCATION_NEXT_IP=$key
 }
 
@@ -1900,60 +1908,81 @@ location_fetch() {
     response=$(
         exec 7>&- 9>&-
         set -o pipefail
-        curl -q -fsS --proxy '' --noproxy '*' --connect-timeout 3 -m 6 --max-filesize 4096 -A "tunel/$TUNEL_VERSION" "${binding[@]}" "$@" "$url" 2>/dev/null | head -c 4097
+        curl -q -fsS --proxy '' --noproxy '*' --connect-timeout 3 -m 6 --max-filesize 4096 -A "tunel/$TUNEL_VERSION" "${binding[@]}" "$@" "$url" 2>&1 | head -c 4097
     ); rc=$?
-    [ "$rc" = 0 ] && [ "${#response}" -le 4096 ] || return 1
+    if [ "$rc" != 0 ]; then
+        response=${response//$'\n'/ }
+        agent_log WARN "位置查询失败：$url（curl $rc）：${response:0:160}" >&2
+        return 1
+    fi
+    [ "${#response}" -le 4096 ] || return 1
     printf '%s' "$response"
 }
 
 # 指定真实公网 IP 查询；NAT 只绑定普通接口发现出口，不放宽为 WARP 默认路由。
 location_refresh() {
-    local now age provider response endpoint source="" reset=${LOCATION_NEEDS_REPORT:-0} route_ok=0
+    local now age provider response endpoint method source="" reset=${LOCATION_NEEDS_REPORT:-0} route_ok=0
     location_select_route && route_ok=1
+    method=$LOCATION_QUERY_MODE
     now=$(date +%s)
     age=$((now-10#${LOCATION_TS:-0}))
     if [ "${LOCATION_VERIFIED:-0}" = 1 ] && [ -n "${LOCATION_SOURCE:-}" ] && [ "$age" -ge 0 ] && [ "$age" -lt 86400 ] &&
-        [ "$route_ok" = 1 ] && [ "$LOCATION_INTERFACE" = "$LOCATION_QUERY_INTERFACE" ] && [ "$LOCATION_METHOD" = "$LOCATION_QUERY_MODE" ] &&
+        [ "$route_ok" = 1 ] && [ "$LOCATION_METHOD" = "$LOCATION_QUERY_MODE" ] &&
+        { [ "$LOCATION_INTERFACE" = "$LOCATION_QUERY_INTERFACE" ] ||
+            { [ "$LOCATION_QUERY_MODE" = interface ] && [ "$LOCATION_INTERFACE" = "$LOCATION_QUERY_IPV6_INTERFACE" ]; }; } &&
         { [ "$LOCATION_QUERY_MODE" != ip ] || [ "$LOCATION_IP" = "$LOCATION_QUERY_IP" ]; }; then return 0; fi
     age=$((now-10#${LOCATION_ATTEMPT_TS:-0}))
     if [ "${LOCATION_ATTEMPT_TS:-0}" != 0 ] && [ "$age" -ge 0 ] && [ "$age" -lt "$AUTOMATIC_INTERVAL" ]; then return 0; fi
     age=$((now-10#$LOCATION_MEMORY_ATTEMPT_TS))
     if [ "$LOCATION_MEMORY_ATTEMPT_TS" != 0 ] && [ "$age" -ge 0 ] && [ "$age" -lt "$AUTOMATIC_INTERVAL" ]; then return 0; fi
     LOCATION_MEMORY_ATTEMPT_TS=$now
-    for provider in ipinfo ip.sb ip-api ip-api-http worker; do
-        [ "${STOP:-0}" != 1 ] || return 0
-        [ "$route_ok" = 1 ] || break
-        resource_maintenance "$(date +%s)"
-        case "$provider" in
-            ipinfo)
-                endpoint='https://ipinfo.io/json'
-                [ "$LOCATION_QUERY_MODE" != ip ] || endpoint="https://ipinfo.io/$LOCATION_QUERY_IP/json"
-                response=$(location_fetch "$endpoint") || continue
-                location_verify_response "$response" ip || continue
-                location_parse "$response" country '' region || continue ;;
-            ip.sb)
-                endpoint='https://api.ip.sb/geoip'
-                [ "$LOCATION_QUERY_MODE" != ip ] || endpoint+="/$LOCATION_QUERY_IP"
-                response=$(location_fetch "$endpoint") || continue
-                location_verify_response "$response" ip || continue
-                location_parse "$response" country_code region_code region || continue ;;
-            ip-api|ip-api-http)
-                if [ "$provider" = ip-api ]; then endpoint='https://ip-api.com/json'
-                else endpoint='http://ip-api.com/json'; fi
-                [ "$LOCATION_QUERY_MODE" != ip ] || endpoint+="/$LOCATION_QUERY_IP"
-                response=$(location_fetch "$endpoint") || continue
-                location_verify_response "$response" query || continue
-                location_parse "$response" countryCode region regionName success || continue ;;
-            worker)
-                [ -n "$REPORT_URL" ] && [ -n "$REPORT_TOKEN" ] || continue
-                # Worker 绑定原生接口请求；公网 IP 模式在外层继续核对响应 IP，避免 WARP 误定位。
-                response=$(LOCATION_QUERY_MODE=interface location_fetch "${REPORT_URL%/api/report}/api/location" -H "Authorization: Bearer $REPORT_TOKEN") || continue
-                location_verify_response "$response" ip || continue
-                location_parse "$response" country region regionName || continue ;;
-        esac
-        source=$provider; [ "$source" != ip-api-http ] || source=ip-api
-        break
+    while [ "$route_ok" = 1 ]; do
+        # NAT/ULA 先绑定原生接口发现出口 IP，再按 IP 查询；查询服务不必支持同一地址族。
+        if [ "$LOCATION_QUERY_MODE" = interface ] && response=$(location_fetch https://api64.ipify.org) &&
+            LOCATION_QUERY_IP=$(location_ip_key "$response"); then
+            LOCATION_QUERY_MODE=ip
+            agent_log INFO "接口 $LOCATION_QUERY_INTERFACE 的 IPv$LOCATION_QUERY_FAMILY 公网出口：$LOCATION_QUERY_IP，按 IP 查询位置"
+        fi
+        for provider in ipinfo ip.sb ip-api ip-api-http worker; do
+            [ "${STOP:-0}" != 1 ] || return 0
+            resource_maintenance "$(date +%s)"
+            case "$provider" in
+                ipinfo)
+                    endpoint='https://ipinfo.io/json'
+                    [ "$LOCATION_QUERY_MODE" != ip ] || endpoint="https://ipinfo.io/$LOCATION_QUERY_IP/json"
+                    response=$(location_fetch "$endpoint") || continue
+                    location_verify_response "$response" ip || continue
+                    location_parse "$response" country '' region || continue ;;
+                ip.sb)
+                    endpoint='https://api.ip.sb/geoip'
+                    [ "$LOCATION_QUERY_MODE" != ip ] || endpoint+="/$LOCATION_QUERY_IP"
+                    response=$(location_fetch "$endpoint") || continue
+                    location_verify_response "$response" ip || continue
+                    location_parse "$response" country_code region_code region || continue ;;
+                ip-api|ip-api-http)
+                    if [ "$provider" = ip-api ]; then endpoint='https://ip-api.com/json'
+                    else endpoint='http://ip-api.com/json'; fi
+                    [ "$LOCATION_QUERY_MODE" != ip ] || endpoint+="/$LOCATION_QUERY_IP"
+                    response=$(location_fetch "$endpoint") || continue
+                    location_verify_response "$response" query || continue
+                    location_parse "$response" countryCode region regionName success || continue ;;
+                worker)
+                    [ -n "$REPORT_URL" ] && [ -n "$REPORT_TOKEN" ] || continue
+                    # Worker 绑定原生接口请求；公网 IP 模式在外层继续核对响应 IP，避免 WARP 误定位。
+                    response=$(LOCATION_QUERY_MODE=interface location_fetch "${REPORT_URL%/api/report}/api/location" -H "Authorization: Bearer $REPORT_TOKEN") || continue
+                    location_verify_response "$response" ip || continue
+                    location_parse "$response" country region regionName || continue ;;
+            esac
+            source=$provider; [ "$source" != ip-api-http ] || source=ip-api
+            break
+        done
+        # 双栈 NAT/ULA 的 IPv4 出口不可用时，再试已发现的原生 IPv6 默认接口。
+        [ -z "$source" ] && [ "$method" = interface ] && [ "$LOCATION_QUERY_FAMILY" = 4 ] && [ -n "$LOCATION_QUERY_IPV6_INTERFACE" ] || break
+        agent_log WARN "IPv4 位置查询未成功，改用接口 $LOCATION_QUERY_IPV6_INTERFACE 的 IPv6 出口"
+        LOCATION_QUERY_MODE=interface; LOCATION_QUERY_IP=""
+        LOCATION_QUERY_FAMILY=6; LOCATION_QUERY_INTERFACE=$LOCATION_QUERY_IPV6_INTERFACE
     done
+    LOCATION_QUERY_MODE=$method
     [ "${STOP:-0}" != 1 ] || return 0
     now=$(date +%s)
     if [ -z "$source" ]; then
@@ -1966,6 +1995,7 @@ location_refresh() {
         LOCATION_ATTEMPT_TS=$now; LOCATION_POLICY=native-v1; LOCATION_NEEDS_REPORT=0
         [ "$reset" != 1 ] || LAST_REPORTED_DOMAIN=""
         if [ "$reset" = 1 ] && [ -n "${DOMAIN:-}" ]; then nodes_refresh || true; fi
+        printf '警告: 国家/地区暂未识别，详细原因见 %s\n' "$AGENT_LOG" >&2
         return 0
     fi
     if [ "${LOCATION_VERIFIED:-0}" != 1 ] || [ "$COUNTRY" != "$LOCATION_NEXT_COUNTRY" ] || [ "$REGION" != "$LOCATION_NEXT_REGION" ] || [ "$REGION_NAME" != "$LOCATION_NEXT_REGION_NAME" ]; then reset=1; fi

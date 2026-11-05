@@ -45,9 +45,25 @@ curl() {
     printf '%s\n' "$*" >> "$FIXTURE_DIR/curl.log"
     local url
     for url; do :; done
+    if [ "$url" = https://api64.ipify.org ]; then
+        local address="$LOCATION_TEST_EXIT_IPV6"
+        [[ " $* " != *" -4 "* ]] || address=$LOCATION_TEST_EXIT_IPV4
+        [ -n "$address" ] || return 22
+        printf '%s' "$address"
+        return 0
+    fi
+    if [ -n "$LOCATION_TEST_EXIT_IPV6" ] && [ "$url" = https://ipinfo.io/json ] && [[ " $* " = *" -6 "* ]]; then
+        printf 'curl: (6) Could not resolve host: ipinfo.io\n' >&2
+        return 6
+    fi
     case "$RESPONSE_PROVIDER:$url" in
-        worker:https://tunel.example/api/location|ipinfo:https://ipinfo.io/*)
-            printf '%s' "$LOCATION_TEST_RESPONSE" ;;
+        worker:https://tunel.example/api/location|ipinfo:https://ipinfo.io/*|ip.sb:https://api.ip.sb/*)
+            if [ -n "$RESPONSE_FAMILY" ] && [[ " $* " != *" -$RESPONSE_FAMILY "* ]]; then return 28; fi
+            if [[ " $* " = *" -4 "* ]] && [ -n "$LOCATION_TEST_IPV4_RESPONSE" ]; then
+                printf '%s' "$LOCATION_TEST_IPV4_RESPONSE"
+            else
+                printf '%s' "$LOCATION_TEST_RESPONSE"
+            fi ;;
         *) return 22 ;;
     esac
 }
@@ -55,6 +71,7 @@ resource_maintenance() { :; }
 agent_log() { printf 'LOG %s %s\n' "$1" "$2"; }
 nodes_refresh() { :; }
 AGENT_ENV="$FIXTURE_DIR/agent.env"
+AGENT_LOG="$FIXTURE_DIR/agent.log"
 TUNEL_VERSION=test
 AUTOMATIC_INTERVAL=3600
 LOCATION_MEMORY_ATTEMPT_TS=0
@@ -70,7 +87,7 @@ LOCATION_VERIFIED=0; LOCATION_NEEDS_REPORT=0
   });
   assert.ifError(result.error);
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  return { stdout: result.stdout, cache: readFileSync(join(dir, 'agent.env'), 'utf8'),
+  return { stdout: result.stdout, stderr: result.stderr, cache: readFileSync(join(dir, 'agent.env'), 'utf8'),
     calls: readFileSync(join(dir, 'curl.log'), 'utf8') };
 }
 
@@ -154,11 +171,13 @@ test('Cloudflare/WARP ownership is still rejected even when the response IP matc
   assert.match(result.stdout, /LOG WARN 国家\/地区识别失败/);
 });
 
-test('IPv6-only containers without ip can complete the bound Worker lookup', t => {
+test('IPv6-only containers without ip can use the bound Worker lookup when IPify is unavailable', t => {
   const result = run(t, refreshOutput, { ipv6: ipv6Route(), RESPONSE_PROVIDER: 'worker', LOCATION_TEST_RESPONSE: JSON.stringify(WORKER_LOCATION) });
   assert.match(result.stdout, /location=US\|CA\|California\|1\|interface/);
   assert.match(result.calls, /-6 --interface if!eth0/);
   assert.match(result.cache, /LOCATION_METHOD=interface\n/);
+  assert.match(result.calls.trim().split('\n')[0], /-6 --interface if!eth0.*https:\/\/api64.ipify.org$/);
+  assert.equal(result.calls.trim().split('\n').length, 6);
 });
 
 test('a missing native route is logged once and does not trigger network calls or rapid retries', t => {
@@ -204,3 +223,269 @@ for (const [label, verified, old, expectedCountry] of [
     assert.equal(stored.locationVerified, verified || old?.locationVerified === true);
   });
 }
+
+
+test('curl errors are logged without leaking the report credential or corrupting JSON output', t => {
+  const result = run(t, String.raw`
+curl() { printf 'curl: (28) Connection timed out\n' >&2; return 28; }
+LOCATION_QUERY_MODE=interface; LOCATION_QUERY_FAMILY=6; LOCATION_QUERY_INTERFACE=eth0
+response=$(location_fetch https://tunel.example/api/location -H 'Authorization: Bearer fixture-report-token'); rc=$?
+printf 'fetch=%s|%s\n' "$rc" "$response"
+`);
+  assert.equal(result.stdout.trim(), 'fetch=1|');
+  assert.match(result.stderr, /位置查询失败.*curl 28.*Connection timed out/);
+  assert.doesNotMatch(result.stderr, /fixture-report-token/);
+});
+
+test('rejected response logs identify the mismatched IP', t => {
+  const result = run(t, refreshOutput, {
+    ...publicRoute, RESPONSE_PROVIDER: 'worker',
+    LOCATION_TEST_RESPONSE: JSON.stringify({ ...WORKER_LOCATION, ip: '2001:470:4892:ff69::999' }),
+  });
+  assert.match(result.stderr, /位置响应 IP 不匹配/);
+  assert.match(result.stderr, /2001:470:4892:ff69:0:0:0:230/);
+});
+
+const privateDualRoute = {
+  ip: true,
+  MOCK_IPV4_ROUTE: 'default via 10.233.105.254 dev eth0 proto dhcp src 10.233.105.230 metric 1024',
+  MOCK_IPV4_ADDRESS: '2: eth0 inet 10.233.105.230/24 scope global',
+  MOCK_IPV6_ROUTE: 'default via fe80::1266:6aff:fe69:2f00 dev eth0 proto ra metric 1024',
+  MOCK_IPV6_ADDRESS: '2: eth0 inet6 fde9:105::230/128 scope global',
+};
+
+test('dual-stack private addresses fall back to the IPv6 exit when IPv4 lookups fail', t => {
+  const result = run(t, refreshOutput + '; printf "family=%s\\n" "$LOCATION_QUERY_FAMILY"', {
+    ...privateDualRoute, RESPONSE_PROVIDER: 'ipinfo', RESPONSE_FAMILY: '6', LOCATION_TEST_RESPONSE: JSON.stringify(IPINFO),
+  });
+  assert.match(result.stdout, /location=US\|\|California\|1\|interface/);
+  assert.match(result.stdout, /family=6/);
+  const calls = result.calls.trim().split('\n');
+  assert.equal(calls.length, 8);
+  assert.match(calls[1], /-4 --interface if!eth0.*https:\/\/ipinfo.io\/json$/);
+  assert.match(calls.at(-1), /-6 --interface if!eth0.*https:\/\/ipinfo.io\/json$/);
+  assert.doesNotMatch(result.calls, /ipinfo.io\/(?:10\.233|fde9:)/);
+  assert.match(result.cache, new RegExp('LOCATION_IP=' + KEY + '\n'));
+  assert.match(result.cache, /LOCATION_METHOD=interface\n/);
+});
+
+test('dual-stack private addresses do not query IPv6 after IPv4 succeeds', t => {
+  const result = run(t, refreshOutput, {
+    ...privateDualRoute, RESPONSE_PROVIDER: 'ipinfo', RESPONSE_FAMILY: '4', LOCATION_TEST_RESPONSE: JSON.stringify({ ...IPINFO, ip: '8.8.8.8' }),
+  });
+  assert.match(result.stdout, /location=US\|\|California\|1\|interface/);
+  assert.equal(result.calls.trim().split('\n').length, 2);
+  assert.match(result.calls, /-4 --interface if!eth0/);
+});
+
+test('dual-stack private addresses reject a WARP IPv4 exit and can use a native IPv6 exit', t => {
+  const warp = { ip: '104.28.1.2', country: 'DE', region: 'Hesse', org: 'AS13335 Cloudflare, Inc.' };
+  const result = run(t, refreshOutput, {
+    ...privateDualRoute, RESPONSE_PROVIDER: 'ipinfo', LOCATION_TEST_RESPONSE: JSON.stringify(IPINFO),
+    LOCATION_TEST_IPV4_RESPONSE: JSON.stringify(warp),
+  });
+  assert.match(result.stdout, /location=US\|\|California\|1\|interface/);
+  assert.match(result.stderr, /Cloudflare\/WARP/);
+  assert.equal(result.calls.trim().split('\n').length, 8);
+});
+
+test('dual-stack failed lookups only try each family once and keep the hourly retry limit', t => {
+  const result = run(t, 'COUNTRY=JP; REGION=13; REGION_NAME=Tokyo; LOCATION_VERIFIED=1; location_refresh; ' + refreshOutput, privateDualRoute);
+  assert.match(result.stdout, /location=JP\|13\|Tokyo\|1\|interface/);
+  assert.match(result.cache, /COUNTRY=JP\n/);
+  const calls = result.calls.trim().split('\n');
+  assert.equal(calls.length, 12);
+  assert.equal(calls.filter(call => call.includes('-4 --interface if!eth0')).length, 6);
+  assert.equal(calls.filter(call => call.includes('-6 --interface if!eth0')).length, 6);
+  assert.equal((result.stdout.match(/国家\/地区识别失败/g) || []).length, 1);
+});
+
+test('dual-stack proc routes without ip can fall back to IPv6 and reuse its cached interface', t => {
+  const result = run(t, 'location_refresh; LOCATION_ATTEMPT_TS=0; LOCATION_MEMORY_ATTEMPT_TS=0; ' + refreshOutput, {
+    ipv4: 'eth0 00000000 0100000A 0003 0 0 100 00000000 0 0 0\n', ipv6: ipv6Route('eth1'),
+    deviceTypes: { eth0: '1', eth1: '1' }, RESPONSE_PROVIDER: 'worker', RESPONSE_FAMILY: '6',
+    LOCATION_TEST_RESPONSE: JSON.stringify(WORKER_LOCATION),
+  });
+  assert.match(result.stdout, /location=US\|CA\|California\|1\|interface/);
+  assert.equal(result.calls.trim().split('\n').length, 12);
+  assert.match(result.calls.trim().split('\n').at(-1), /-6 --interface if!eth1/);
+  assert.match(result.cache, /LOCATION_INTERFACE=eth1\n/);
+});
+
+
+test('dual-stack private addresses still reject a WARP IPv6 exit', t => {
+  const warp = { ...IPINFO, ip: '2606:4700:110:8123::1', org: 'AS13335 Cloudflare, Inc.' };
+  const result = run(t, refreshOutput, {
+    ...privateDualRoute, RESPONSE_PROVIDER: 'ipinfo', RESPONSE_FAMILY: '6', LOCATION_TEST_RESPONSE: JSON.stringify(warp),
+  });
+  assert.match(result.stdout, /location=\|\|\|0\|interface/);
+  assert.match(result.cache, /COUNTRY=\n/);
+  assert.match(result.stderr, /Cloudflare\/WARP/);
+  assert.equal(result.calls.trim().split('\n').length, 12);
+});
+
+test('a local public IPv6 address still wins over a private IPv4 default route', t => {
+  const result = run(t, refreshOutput, {
+    ...privateDualRoute, ...publicRoute, RESPONSE_PROVIDER: 'ipinfo', LOCATION_TEST_RESPONSE: JSON.stringify(IPINFO),
+  });
+  assert.match(result.stdout, /location=US\|\|California\|1\|ip/);
+  assert.equal(result.calls.trim().split('\n').length, 1);
+  assert.match(result.calls, new RegExp('https://ipinfo.io/' + KEY + '/json'));
+});
+
+test('IPv4-only private routes do not retry an absent IPv6 route', t => {
+  const result = run(t, 'location_refresh; location_refresh;', {
+    ...privateDualRoute, MOCK_IPV6_ROUTE: '', MOCK_IPV6_ADDRESS: '',
+  });
+  assert.equal(result.calls.trim().split('\n').length, 6);
+  assert.doesNotMatch(result.calls, /-6 --interface/);
+  assert.match(result.stdout, /接口 eth0（IPv4/);
+});
+
+
+test('the ct230 WARP IPv4 exit and IPv6 IPInfo DNS failure fall through to native IPv6 IP.SB', t => {
+  const result = run(t, String.raw`
+curl() {
+    printf '%s\n' "$*" >> "$FIXTURE_DIR/curl.log"
+    local url
+    for url; do :; done
+    if [ "$url" = https://ipinfo.io/json ] && [[ " $* " = *" -4 "* ]]; then
+        printf '%s' "$LOCATION_TEST_IPV4_RESPONSE"
+    elif [ "$url" = https://ipinfo.io/json ] && [[ " $* " = *" -6 "* ]]; then
+        printf 'curl: (6) Could not resolve host: ipinfo.io\n' >&2
+        return 6
+    elif [ "$url" = https://api.ip.sb/geoip ] && [[ " $* " = *" -6 "* ]]; then
+        printf '%s' "$LOCATION_TEST_RESPONSE"
+    else
+        return 22
+    fi
+}
+` + refreshOutput, {
+    ...privateDualRoute,
+    LOCATION_TEST_IPV4_RESPONSE: JSON.stringify({ ip: '104.28.227.187', country: 'US', region: 'California', org: 'AS13335 Cloudflare, Inc.' }),
+    LOCATION_TEST_RESPONSE: JSON.stringify({ ip: IPV6, country_code: 'US', region_code: 'CA', region: 'California', asn: 6939, organization: 'Hurricane Electric LLC' }),
+  });
+  assert.match(result.stdout, /location=US\|CA\|California\|1\|interface/);
+  assert.match(result.stderr, /Cloudflare\/WARP/);
+  assert.match(result.stderr, /curl 6.*Could not resolve host: ipinfo.io/);
+  assert.equal(result.calls.trim().split('\n').length, 9);
+  assert.match(result.calls.trim().split('\n').at(-1), /-6 --interface if!eth0.*https:\/\/api.ip.sb\/geoip$/);
+  assert.match(result.cache, /LOCATION_SOURCE=ip.sb\n/);
+  assert.match(result.cache, new RegExp('LOCATION_IP=' + KEY + '\n'));
+});
+
+
+const WARP_IPV4_LOCATION = { ip: '104.28.227.187', country: 'US', region: 'California', org: 'AS13335 Cloudflare, Inc.' };
+
+test('ct230 discovers its actual IPv6 exit before querying IPInfo by IP over available connectivity', t => {
+  const result = run(t, 'location_refresh; LOCATION_ATTEMPT_TS=0; LOCATION_MEMORY_ATTEMPT_TS=0; ' + refreshOutput, {
+    ...privateDualRoute, RESPONSE_PROVIDER: 'ipinfo', LOCATION_TEST_EXIT_IPV6: IPV6,
+    LOCATION_TEST_IPV4_RESPONSE: JSON.stringify(WARP_IPV4_LOCATION), LOCATION_TEST_RESPONSE: JSON.stringify(IPINFO),
+  });
+  assert.match(result.stdout, /location=US\|\|California\|1\|interface/);
+  const calls = result.calls.trim().split('\n');
+  assert.equal(calls.length, 8);
+  assert.match(calls.at(-2), /-6 --interface if!eth0.*https:\/\/api64.ipify.org$/);
+  assert.match(calls.at(-1), new RegExp('https://ipinfo.io/' + KEY + '/json$'));
+  assert.doesNotMatch(calls.at(-1), /--interface| -6 /);
+  assert.doesNotMatch(result.calls, /-6 --interface if!eth0.*https:\/\/ipinfo.io\/json/);
+  assert.match(result.cache, /LOCATION_SOURCE=ipinfo\n/);
+  assert.match(result.cache, /LOCATION_METHOD=interface\n/);
+  assert.match(result.cache, new RegExp('LOCATION_IP=' + KEY + '\n'));
+  assert.match(result.cache, /LOCATION_INTERFACE=eth0\n/);
+});
+
+test('a country response for another IP cannot overwrite the discovered native IPv6 location', t => {
+  const result = run(t, 'COUNTRY=JP; REGION=13; REGION_NAME=Tokyo; LOCATION_VERIFIED=1; ' + refreshOutput, {
+    ...privateDualRoute, RESPONSE_PROVIDER: 'ipinfo', LOCATION_TEST_EXIT_IPV6: IPV6,
+    LOCATION_TEST_IPV4_RESPONSE: JSON.stringify(WARP_IPV4_LOCATION),
+    LOCATION_TEST_RESPONSE: JSON.stringify({ ...IPINFO, ip: '2001:470:4892:ff69::999' }),
+  });
+  assert.match(result.stdout, /location=JP\|13\|Tokyo\|1\|interface/);
+  assert.match(result.cache, /COUNTRY=JP\n/);
+  assert.match(result.stderr, /位置响应 IP 不匹配/);
+  assert.match(result.stderr, new RegExp(KEY));
+});
+
+test('an IP-discovered Cloudflare IPv6 exit is still rejected by ASN ownership verification', t => {
+  const warp = { ...IPINFO, ip: '2606:4700:110:8123::1', org: 'AS13335 Cloudflare, Inc.' };
+  const result = run(t, refreshOutput, {
+    ...privateDualRoute, RESPONSE_PROVIDER: 'ipinfo', LOCATION_TEST_EXIT_IPV6: warp.ip,
+    LOCATION_TEST_IPV4_RESPONSE: JSON.stringify(WARP_IPV4_LOCATION), LOCATION_TEST_RESPONSE: JSON.stringify(warp),
+  });
+  assert.match(result.stdout, /location=\|\|\|0\|interface/);
+  assert.match(result.cache, /COUNTRY=\n/);
+  assert.match(result.stderr, /Cloudflare\/WARP/);
+  assert.match(result.calls, /ipinfo.io\/2606:4700:110:8123:0:0:0:1\/json/);
+});
+
+test('invalid private IP discovery data is not used as a public country lookup target', t => {
+  const result = run(t, refreshOutput, { ...privateDualRoute, LOCATION_TEST_EXIT_IPV6: 'fde9:105::230' });
+  assert.match(result.stdout, /location=\|\|\|0\|interface/);
+  assert.match(result.cache, /COUNTRY=\n/);
+  assert.doesNotMatch(result.calls, /ipinfo.io\/fde9:|geoip\/fde9:/);
+});
+
+test('NAT IPv4 also supports IP discovery followed by an explicit country lookup without querying IPv6', t => {
+  const result = run(t, refreshOutput, {
+    ...privateDualRoute, RESPONSE_PROVIDER: 'ipinfo', LOCATION_TEST_EXIT_IPV4: '8.8.8.8',
+    LOCATION_TEST_RESPONSE: JSON.stringify({ ...IPINFO, ip: '8.8.8.8' }),
+  });
+  assert.match(result.stdout, /location=US\|\|California\|1\|interface/);
+  const calls = result.calls.trim().split('\n');
+  assert.equal(calls.length, 2);
+  assert.match(calls[0], /-4 --interface if!eth0.*https:\/\/api64.ipify.org$/);
+  assert.match(calls[1], /https:\/\/ipinfo.io\/8.8.8.8\/json$/);
+  assert.doesNotMatch(calls[1], /--interface/);
+  assert.doesNotMatch(result.calls, /-6 --interface/);
+  assert.match(result.cache, /LOCATION_METHOD=interface\n/);
+});
+
+
+test('IP.SB remains a country lookup fallback for an IP-discovered IPv6 exit when IPInfo fails', t => {
+  const result = run(t, refreshOutput, {
+    ...privateDualRoute, RESPONSE_PROVIDER: 'ip.sb', LOCATION_TEST_EXIT_IPV6: IPV6,
+    LOCATION_TEST_IPV4_RESPONSE: JSON.stringify(WARP_IPV4_LOCATION),
+    LOCATION_TEST_RESPONSE: JSON.stringify({ ip: IPV6, country_code: 'US', region_code: 'CA', region: 'California', asn: 6939, organization: 'Hurricane Electric LLC' }),
+  });
+  assert.match(result.stdout, /location=US\|CA\|California\|1\|interface/);
+  const calls = result.calls.trim().split('\n');
+  assert.equal(calls.length, 9);
+  assert.match(calls.at(-2), new RegExp('https://ipinfo.io/' + KEY + '/json$'));
+  assert.match(calls.at(-1), new RegExp('https://api.ip.sb/geoip/' + KEY + '$'));
+  assert.doesNotMatch(calls.at(-1), /--interface/);
+  assert.match(result.cache, /LOCATION_SOURCE=ip.sb\n/);
+  assert.match(result.cache, /LOCATION_METHOD=interface\n/);
+});
+
+
+test('IPv4-only minimal containers without ip can discover the NAT exit from their proc default route', t => {
+  const result = run(t, refreshOutput, {
+    ipv4: 'eth0 00000000 0100000A 0003 0 0 100 00000000 0 0 0\n',
+    RESPONSE_PROVIDER: 'ipinfo', LOCATION_TEST_EXIT_IPV4: '8.8.8.8',
+    LOCATION_TEST_RESPONSE: JSON.stringify({ ...IPINFO, ip: '8.8.8.8' }),
+  });
+  assert.match(result.stdout, /location=US\|\|California\|1\|interface/);
+  const calls = result.calls.trim().split('\n');
+  assert.equal(calls.length, 2);
+  assert.match(calls[0], /-4 --interface if!eth0.*https:\/\/api64.ipify.org$/);
+  assert.doesNotMatch(result.calls, / -6 /);
+  assert.match(result.cache, /LOCATION_IP=8.8.8.8\n/);
+  assert.match(result.cache, /LOCATION_METHOD=interface\n/);
+});
+
+test('IPv6-only minimal containers can retain a bound Worker fallback after discovering their NAT exit', t => {
+  const result = run(t, refreshOutput, {
+    ipv6: ipv6Route(), RESPONSE_PROVIDER: 'worker', RESPONSE_FAMILY: '6', LOCATION_TEST_EXIT_IPV6: IPV6,
+    LOCATION_TEST_RESPONSE: JSON.stringify(WORKER_LOCATION),
+  });
+  assert.match(result.stdout, /location=US\|CA\|California\|1\|interface/);
+  const calls = result.calls.trim().split('\n');
+  assert.equal(calls.length, 6);
+  assert.match(calls[0], /-6 --interface if!eth0.*https:\/\/api64.ipify.org$/);
+  assert.match(calls.at(-1), /-6 --interface if!eth0.*https:\/\/tunel.example\/api\/location$/);
+  assert.doesNotMatch(result.calls, / -4 /);
+  assert.match(result.cache, /LOCATION_SOURCE=worker\n/);
+  assert.match(result.cache, /LOCATION_METHOD=interface\n/);
+  assert.match(result.cache, new RegExp('LOCATION_IP=' + KEY + '\n'));
+});
